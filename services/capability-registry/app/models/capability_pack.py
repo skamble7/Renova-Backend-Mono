@@ -13,14 +13,13 @@ from .integrations import ResourceRef, RuntimePolicy
 # Global Capability (authoritative registry)
 # ─────────────────────────────────────────────────────────────
 class GlobalCapability(BaseModel):
-    id: str = Field(..., description="Stable capability id (e.g., cap.catalog.services)")
+    id: str
     name: str
     description: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
     parameters_schema: Optional[Dict[str, Any]] = None
-    produces_kinds: List[str] = Field(default_factory=list)  # must be valid kinds
-    requires_kinds: Optional[List[str]] = None               # optional inputs (artifact kinds)
-    agent: Optional[str] = None  # e.g., "catalog.services.v1"
+    produces_kinds: List[str] = Field(default_factory=list)
+    agent: Optional[str] = None
 
 class GlobalCapabilityCreate(BaseModel):
     id: str
@@ -29,7 +28,6 @@ class GlobalCapabilityCreate(BaseModel):
     tags: List[str] = Field(default_factory=list)
     parameters_schema: Optional[Dict[str, Any]] = None
     produces_kinds: List[str] = Field(default_factory=list)
-    requires_kinds: Optional[List[str]] = None
     agent: Optional[str] = None
 
 class GlobalCapabilityUpdate(BaseModel):
@@ -38,7 +36,6 @@ class GlobalCapabilityUpdate(BaseModel):
     tags: Optional[List[str]] = None
     parameters_schema: Optional[Dict[str, Any]] = None
     produces_kinds: Optional[List[str]] = None
-    requires_kinds: Optional[List[str]] = None
     agent: Optional[str] = None
 
 # ─────────────────────────────────────────────────────────────
@@ -90,7 +87,6 @@ class CapabilitySnapshot(BaseModel):
     tags: List[str] = Field(default_factory=list)
     parameters_schema: Optional[Dict[str, Any]] = None
     produces_kinds: List[str] = Field(default_factory=list)
-    requires_kinds: Optional[List[str]] = None
     agent: Optional[str] = None
 
 class CapabilityPack(BaseModel):

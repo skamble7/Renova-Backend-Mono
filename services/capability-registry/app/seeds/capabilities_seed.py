@@ -18,10 +18,13 @@ VALIDATE_KINDS = os.getenv("CAPABILITIES_SEED_VALIDATE_KINDS", "0") in ("1", "tr
 
 
 def _collect_kinds(capabilities: List[Dict[str, Any]]) -> List[str]:
+    """
+    GlobalCapability no longer carries requires_kinds.
+    We only validate produces_kinds here to ensure kinds are registered.
+    """
     kinds: List[str] = []
     for c in capabilities:
         kinds.extend(c.get("produces_kinds") or [])
-        kinds.extend(c.get("requires_kinds") or [])
     seen = set()
     out: List[str] = []
     for k in kinds:
@@ -56,7 +59,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
             "cam.source.manifest",
             "cam.source.file"
         ],
-        "requires_kinds": [],
         "agent": None,
     },
 
@@ -70,7 +72,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["domain", "semantics", "nlp", "cobol", "jcl"],
         "parameters_schema": None,
         "produces_kinds": ["cam.domain.legacy_terms"],
-        "requires_kinds": ["cam.cobol.program", "cam.cobol.copybook", "cam.jcl.job"],
         "agent": None,
     },
     {
@@ -80,7 +81,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["domain", "semantics", "nlp"],
         "parameters_schema": None,
         "produces_kinds": ["cam.domain.acronyms"],
-        "requires_kinds": ["cam.cobol.program", "cam.jcl.job"],
         "agent": None,
     },
     {
@@ -90,7 +90,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["domain", "rules", "analysis", "cobol"],
         "parameters_schema": None,
         "produces_kinds": ["cam.domain.business_rules"],
-        "requires_kinds": ["cam.cobol.program", "cam.cobol.paragraph_flow"],
         "agent": None,
     },
 
@@ -104,7 +103,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["code", "inventory", "cobol", "jcl"],
         "parameters_schema": None,
         "produces_kinds": ["cam.code.legacy_component"],
-        "requires_kinds": [],
         "agent": None,
     },
     {
@@ -114,7 +112,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["code", "graph", "calls"],
         "parameters_schema": None,
         "produces_kinds": ["cam.code.call_hierarchy"],
-        "requires_kinds": ["cam.cobol.program"],
         "agent": None,
     },
     {
@@ -124,7 +121,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["code", "dependencies"],
         "parameters_schema": None,
         "produces_kinds": ["cam.code.dependency_map"],
-        "requires_kinds": ["cam.cobol.program", "cam.jcl.step", "cam.db2.table_usage", "cam.vsam.cluster"],
         "agent": None,
     },
     {
@@ -134,7 +130,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["code", "interfaces"],
         "parameters_schema": None,
         "produces_kinds": ["cam.code.interface"],
-        "requires_kinds": ["cam.cobol.program", "cam.cobol.copybook", "cam.db2.table_usage", "cam.vsam.cluster"],
         "agent": None,
     },
 
@@ -148,7 +143,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["data", "copybook", "structure"],
         "parameters_schema": None,
         "produces_kinds": ["cam.data.legacy_structure"],
-        "requires_kinds": ["cam.cobol.copybook"],
         "agent": None,
     },
     {
@@ -158,7 +152,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["data", "mapping"],
         "parameters_schema": None,
         "produces_kinds": ["cam.data.mapping"],
-        "requires_kinds": ["cam.data.legacy_structure", "cam.domain.legacy_terms"],
         "agent": None,
     },
     {
@@ -168,7 +161,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["data", "usage"],
         "parameters_schema": None,
         "produces_kinds": ["cam.data.usage_matrix"],
-        "requires_kinds": ["cam.cobol.program", "cam.db2.table_usage", "cam.jcl.step"],
         "agent": None,
     },
 
@@ -182,7 +174,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["workflow", "jcl", "batch"],
         "parameters_schema": None,
         "produces_kinds": ["cam.workflow.legacy_job"],
-        "requires_kinds": ["cam.jcl.job"],
         "agent": None,
     },
     {
@@ -192,7 +183,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["workflow", "graph"],
         "parameters_schema": None,
         "produces_kinds": ["cam.workflow.job_flow"],
-        "requires_kinds": ["cam.workflow.legacy_job", "cam.jcl.step"],
         "agent": None,
     },
     {
@@ -202,7 +192,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["workflow", "scheduling"],
         "parameters_schema": None,
         "produces_kinds": ["cam.workflow.scheduling"],
-        "requires_kinds": ["cam.workflow.legacy_job"],
         "agent": None,
     },
 
@@ -216,7 +205,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["mapping", "modernization"],
         "parameters_schema": None,
         "produces_kinds": ["cam.mapping.legacy_to_modern"],
-        "requires_kinds": ["cam.cobol.program", "cam.code.interface", "cam.code.call_hierarchy"],
         "agent": None,
     },
     {
@@ -226,7 +214,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["mapping", "data"],
         "parameters_schema": None,
         "produces_kinds": ["cam.mapping.data_to_entity"],
-        "requires_kinds": ["cam.data.legacy_structure", "cam.domain.legacy_terms"],
         "agent": None,
     },
     {
@@ -236,7 +223,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["mapping", "workflow"],
         "parameters_schema": None,
         "produces_kinds": ["cam.mapping.job_to_process"],
-        "requires_kinds": ["cam.workflow.legacy_job", "cam.workflow.job_flow", "cam.domain.business_rules"],
         "agent": None,
     },
 
@@ -250,7 +236,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["ops", "performance"],
         "parameters_schema": None,
         "produces_kinds": ["cam.ops.performance_profile"],
-        "requires_kinds": [],
         "agent": None,
     },
     {
@@ -260,7 +245,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["ops", "errors"],
         "parameters_schema": None,
         "produces_kinds": ["cam.ops.error_catalog"],
-        "requires_kinds": ["cam.cobol.program", "cam.jcl.job"],
         "agent": None,
     },
     {
@@ -270,7 +254,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["ops", "security"],
         "parameters_schema": None,
         "produces_kinds": ["cam.ops.security_rules"],
-        "requires_kinds": ["cam.cobol.program", "cam.jcl.job"],
         "agent": None,
     },
 
@@ -284,7 +267,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["cobol", "copybook", "parser"],
         "parameters_schema": None,
         "produces_kinds": ["cam.cobol.copybook"],
-        "requires_kinds": [],
         "agent": None,
     },
     {
@@ -294,7 +276,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["cobol", "program", "parser"],
         "parameters_schema": None,
         "produces_kinds": ["cam.cobol.program"],
-        "requires_kinds": [],
         "agent": None,
     },
     {
@@ -304,7 +285,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["cobol", "control-flow"],
         "parameters_schema": None,
         "produces_kinds": ["cam.cobol.paragraph_flow"],
-        "requires_kinds": ["cam.cobol.program"],
         "agent": None,
     },
     {
@@ -314,7 +294,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["cobol", "files", "vsam"],
         "parameters_schema": None,
         "produces_kinds": ["cam.cobol.file_mapping"],
-        "requires_kinds": ["cam.cobol.program"],
         "agent": None,
     },
     {
@@ -324,7 +303,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["jcl", "batch", "parser"],
         "parameters_schema": None,
         "produces_kinds": ["cam.jcl.job"],
-        "requires_kinds": [],
         "agent": None,
     },
     {
@@ -334,7 +312,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["jcl", "batch"],
         "parameters_schema": None,
         "produces_kinds": ["cam.jcl.step"],
-        "requires_kinds": ["cam.jcl.job"],
         "agent": None,
     },
     {
@@ -344,7 +321,6 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["db2", "sql"],
         "parameters_schema": None,
         "produces_kinds": ["cam.db2.table_usage"],
-        "requires_kinds": ["cam.cobol.program"],
         "agent": None,
     },
     {
@@ -354,8 +330,40 @@ CAPABILITY_SEED: List[Dict[str, Any]] = [
         "tags": ["vsam", "files"],
         "parameters_schema": None,
         "produces_kinds": ["cam.vsam.cluster"],
-        "requires_kinds": ["cam.jcl.step"],
         "agent": None,
+    },
+
+    # =========================================================
+    # NEW: Core diagram generation via agent (aligned with new diagram kinds)
+    # =========================================================
+    {
+        "id": "cap.diagram.generate_core_views",
+        "name": "Generate Core COBOL Modernization Views",
+        "description": "Produce job flow, call graph, data flow, and a system context diagram using existing structured artifacts when available.",
+        "tags": ["diagram", "visualization", "cobol", "modernization"],
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "notation": {"type": "string", "enum": ["c4", "mermaid", "plantuml", "dot", "drawio"]},
+                "include": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": [
+                        "cam.diagram.job_flow",
+                        "cam.diagram.call_graph",
+                        "cam.diagram.data_flow",
+                        "cam.diagram.system_context"
+                    ]}
+                }
+            },
+            "additionalProperties": True
+        },
+        "produces_kinds": [
+            "cam.diagram.job_flow",
+            "cam.diagram.call_graph",
+            "cam.diagram.data_flow",
+            "cam.diagram.system_context"
+        ],
+        "agent": "agent.renova.kindgen.v1"
     },
 ]
 

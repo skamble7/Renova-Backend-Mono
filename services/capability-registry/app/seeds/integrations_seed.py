@@ -99,6 +99,26 @@ SEED_CONNECTORS: List[Dict[str, Any]] = [
         "secrets": [],
         "doc_url": None,
     },
+    # Agent connector for kind generation (diagram + other JSON kinds)
+    # NOTE: models.integrations.ConnectorCreate.type does NOT include "agent" in its Literal,
+    # so we register this as a generic custom connector.
+    {
+        "key": "agent.renova.kindgen",
+        "type": "custom",  # was "agent" -> use "custom" to satisfy the enum
+        "vendor": "renova",
+        "version": "v1",
+        "capabilities": ["kind-generate"],
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "model": {"type": "string"},
+                "max_tokens": {"type": "integer"}
+            },
+            "additionalProperties": True
+        },
+        "secrets": [],
+        "doc_url": None
+    },
 ]
 
 
@@ -204,6 +224,86 @@ SEED_TOOLS: List[Dict[str, Any]] = [
         "produces_kinds": ["cam.db2.table_usage"],
         "requires_kinds": ["cam.cobol.program"]
     },
+
+    # Agent-backed diagram generators (one tool per kind)
+    {
+        "key": "tool.kindgen.diagram.job_flow",
+        "connector_key": "agent.renova.kindgen",
+        "operation": "generate",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target_kind": {"const": "cam.diagram.job_flow"},
+                "notation": {"type": "string", "enum": ["c4", "mermaid", "plantuml", "dot", "drawio"]},
+                "context": {"type": "object"}
+            },
+            "required": ["target_kind"],
+            "additionalProperties": True
+        },
+        "output_schema": None,
+        "produces_kinds": ["cam.diagram.job_flow"],
+        "requires_kinds": ["cam.workflow.job_flow"]
+    },
+    {
+        "key": "tool.kindgen.diagram.call_graph",
+        "connector_key": "agent.renova.kindgen",
+        "operation": "generate",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target_kind": {"const": "cam.diagram.call_graph"},
+                "notation": {"type": "string", "enum": ["c4", "mermaid", "plantuml", "dot", "drawio"]},
+                "context": {"type": "object"}
+            },
+            "required": ["target_kind"],
+            "additionalProperties": True
+        },
+        "output_schema": None,
+        "produces_kinds": ["cam.diagram.call_graph"],
+        "requires_kinds": ["cam.code.call_hierarchy"]
+    },
+    {
+        "key": "tool.kindgen.diagram.data_flow",
+        "connector_key": "agent.renova.kindgen",
+        "operation": "generate",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target_kind": {"const": "cam.diagram.data_flow"},
+                "notation": {"type": "string", "enum": ["c4", "mermaid", "plantuml", "dot", "drawio"]},
+                "context": {"type": "object"}
+            },
+            "required": ["target_kind"],
+            "additionalProperties": True
+        },
+        "output_schema": None,
+        "produces_kinds": ["cam.diagram.data_flow"],
+        "requires_kinds": [
+            "cam.workflow.job_flow",
+            "cam.code.call_hierarchy",
+            "cam.cobol.file_mapping",
+            "cam.db2.table_usage",
+            "cam.vsam.cluster"
+        ]
+    },
+    {
+        "key": "tool.kindgen.diagram.system_context",
+        "connector_key": "agent.renova.kindgen",
+        "operation": "generate",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target_kind": {"const": "cam.diagram.system_context"},
+                "notation": {"type": "string", "enum": ["c4", "mermaid", "plantuml", "dot", "drawio"]},
+                "context": {"type": "object"}
+            },
+            "required": ["target_kind"],
+            "additionalProperties": True
+        },
+        "output_schema": None,
+        "produces_kinds": ["cam.diagram.system_context"],
+        "requires_kinds": []
+    },
 ]
 
 
@@ -229,40 +329,44 @@ async def _maybe_validate_kinds():
 async def run_integrations_seed(db: AsyncIOMotorDatabase):
     await ensure_integ_indexes(db)
 
-    if SKIP_IF_EXISTS:
-        has_connectors = await db["integrations_connectors"].count_documents({}) > 0
-        has_tools = await db["integrations_tools"].count_documents({}) > 0
-        if has_connectors or has_tools:
-            logger.info(
-                "Integrations seed: skipped (already have connectors/tools)",
-                extra={"connectors": has_connectors, "tools": has_tools},
-            )
-            return {"skipped": True, "connectors": has_connectors, "tools": has_tools}
+    logger.info("Integrations seed: env",
+                extra={
+                    "INTEGRATIONS_SEED_SKIP_IF_EXISTS": os.getenv("INTEGRATIONS_SEED_SKIP_IF_EXISTS"),
+                    "INTEGRATIONS_SEED_VALIDATE_KINDS": os.getenv("INTEGRATIONS_SEED_VALIDATE_KINDS"),
+                })
 
     await _maybe_validate_kinds()
 
     c_added = 0
     for raw in SEED_CONNECTORS:
-        if not await get_connector(db, raw["key"]):
+        existing = await get_connector(db, raw["key"])
+        if not existing:
             await create_connector(db, ConnectorCreate(**raw))
             c_added += 1
 
     t_added = 0
     for raw in SEED_TOOLS:
-        if not await get_tool(db, raw["key"]):
+        existing = await get_tool(db, raw["key"])
+        if not existing:
             if not await get_connector(db, raw["connector_key"]):
                 seed = next((c for c in SEED_CONNECTORS if c["key"] == raw["connector_key"]), None)
                 if seed:
                     await create_connector(db, ConnectorCreate(**seed))
                     c_added += 1
+                else:
+                    logger.error("Tool references unknown connector",
+                                 extra={"tool_key": raw["key"], "connector_key": raw["connector_key"]})
+                    continue
             await create_tool(db, ToolCreate(**raw))
             t_added += 1
 
     total_c = await db["integrations_connectors"].count_documents({})
     total_t = await db["integrations_tools"].count_documents({})
     logger.info("Integrations seed done", extra={
-        "connectors_added": c_added, "tools_added": t_added,
-        "total_connectors": total_c, "total_tools": total_t
+        "connectors_added": c_added,
+        "tools_added": t_added,
+        "total_connectors": total_c,
+        "total_tools": total_t
     })
     return {"skipped": False, "connectors_added": c_added, "tools_added": t_added,
             "total_connectors": total_c, "total_tools": total_t}
