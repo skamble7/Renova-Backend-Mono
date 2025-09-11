@@ -1,14 +1,17 @@
 # services/learning-service/app/executor/executor.py
 from __future__ import annotations
 from typing import Any, Dict, List
+import logging
 from app.executor.runtime import make_runtime_config
 from app.executor.tool_runner import run_tool
 from app.clients import artifact_service
 
+log = logging.getLogger("app.executor.executor")
+
+
 async def _persist(workspace_id: str, run_id: str, generated: List[Dict[str, Any]]) -> List[str]:
     if not generated:
         return []
-    # Normalize minimal envelope; artifact-service adapter will sanitize further.
     items = []
     for g in generated:
         k = (g.get("kind") or "").strip() or "cam.document"
@@ -19,7 +22,7 @@ async def _persist(workspace_id: str, run_id: str, generated: List[Dict[str, Any
             "data": g.get("data"),
             "natural_key": f"{k}:{n}".lower(),
             "provenance": {"author": "learning-service", "run_id": run_id},
-            "tags": ["generated","learning"],
+            "tags": ["generated", "learning"],
         })
     resp = await artifact_service.upsert_batch(workspace_id, items, run_id=run_id)
     ids: List[str] = []
@@ -28,7 +31,9 @@ async def _persist(workspace_id: str, run_id: str, generated: List[Dict[str, Any
             aid = r.get("artifact_id") or r.get("id") or (r.get("artifact") or {}).get("_id")
             if aid:
                 ids.append(str(aid))
+    log.info("persist.batch", extra={"count": len(ids)})
     return ids
+
 
 def _requires_satisfied(snapshot: Dict[str, Any], required_kinds: List[str]) -> bool:
     if not required_kinds:
@@ -37,19 +42,13 @@ def _requires_satisfied(snapshot: Dict[str, Any], required_kinds: List[str]) -> 
     present = {a.get("kind") for a in arts if isinstance(a, dict)}
     return all(k in present for k in required_kinds)
 
+
 async def execute_playbook(*, workspace_id: str, workspace_name: str, playbook: Dict[str, Any], tool_params: Dict[str, Any], run_id: str) -> Dict[str, Any]:
     """
-    Simple scheduler:
-      - snapshot the workspace artifacts once (cheap baseline readiness check)
-      - for each step:
-          - gate on requires_kinds
-          - dispatch deterministic tool
-          - persist emitted artifacts
+    (Legacy single-file executor – kept for parity)
     """
     logs: List[str] = []
     runtime = make_runtime_config(workspace_name)
-
-    # one-time snapshot for requires_kinds; for v0 we don't refresh mid-run
     snapshot = await artifact_service.get_workspace_with_artifacts(workspace_id, include_deleted=False)
 
     generated_ids: List[str] = []
@@ -57,24 +56,18 @@ async def execute_playbook(*, workspace_id: str, workspace_name: str, playbook: 
         sid = step.get("id") or step.get("capability") or "step"
         cap = step.get("capability") or ""
         requires = [r for r in (step.get("requires_kinds") or []) if isinstance(r, str)]
-        emits = [e for e in (step.get("emits") or []) if isinstance(e, str)]
 
         if not _requires_satisfied(snapshot, requires):
-            logs.append(f"gate.skip {sid}: requires={requires} not satisfied")
+            msg = f"gate.skip {sid}: requires={requires} not satisfied"
+            logs.append(msg)
+            log.info("execute_playbook.gate", extra={"step": sid, "requires": requires, "result": "skip"})
             continue
 
-        # Prepare params for the tool
         params = dict(step.get("params") or {})
-        # Fill in repo paths for common steps
         if cap in ("tool.scm.checkout",):
-            if "repo_path" not in params:
-                # Expect clone to create: /landing_zone/<ws>/<repo>
-                # If caller passed 'repo_root' via tool_params, reuse
-                rp = tool_params.get("repo_path")
-                if rp:
-                    params["repo_path"] = rp
+            if "repo_path" not in params and tool_params.get("repo_path"):
+                params["repo_path"] = tool_params["repo_path"]
 
-        # If first step is clone and we have RepoSpec in tool_params, merge
         if cap == "tool.scm.clone":
             params.setdefault("repo_url", tool_params.get("repo_url"))
             params.setdefault("ref", tool_params.get("ref", "main"))
@@ -82,7 +75,7 @@ async def execute_playbook(*, workspace_id: str, workspace_name: str, playbook: 
             params.setdefault("sparse_globs", tool_params.get("sparse_globs", []))
 
         try:
-            arts, tlogs = await run_tool(cap, params, runtime)
+            arts, tlogs, _extras = await run_tool(cap, params, runtime)
             logs.extend([f"{sid}: {m}" for m in tlogs])
 
             if arts:
@@ -91,5 +84,6 @@ async def execute_playbook(*, workspace_id: str, workspace_name: str, playbook: 
                 logs.append(f"{sid}: persisted={len(ids)}")
         except Exception as e:
             logs.append(f"{sid}: ERROR {e}")
+            log.exception("execute_playbook.step_error", extra={"step": sid})
 
     return {"artifact_ids": generated_ids, "logs": logs}

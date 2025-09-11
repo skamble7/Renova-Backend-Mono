@@ -1,3 +1,4 @@
+# services/learning-service/app/models/events.py
 from pydantic import BaseModel
 from typing import Any
 

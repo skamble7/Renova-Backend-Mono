@@ -1,3 +1,4 @@
+# services/learning-service/app/clients/capability_registry.py
 from __future__ import annotations
 import httpx
 from typing import Optional

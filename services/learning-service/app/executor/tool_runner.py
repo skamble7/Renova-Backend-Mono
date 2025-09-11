@@ -5,15 +5,20 @@ from pathlib import Path, PurePosixPath
 from glob import glob
 import json
 import re
+import logging
 
 from app.clients import fetcher_github as gh
 from app.clients import parser_proleap as proleap
 from app.clients import parser_jcl, analyzer_db2
 from app.config import settings
 
+log = logging.getLogger("app.executor.tool_runner")
+
+
 def _lz(*, landing_zone: str, landing_subdir: str, repo_tail: str = "") -> str:
     base = PurePosixPath(landing_zone) / landing_subdir
     return str(base / repo_tail) if repo_tail else str(base)
+
 
 def _first(*vals):
     for v in vals:
@@ -24,7 +29,9 @@ def _first(*vals):
         return v
     return None
 
+
 _GH_SHORT_RE = re.compile(r"^[\w\-.]+/[\w\-.]+(?:\.git)?$")
+
 
 def _normalize_repo_url(repo: str) -> str:
     repo = (repo or "").strip()
@@ -38,6 +45,7 @@ def _normalize_repo_url(repo: str) -> str:
     if "://" not in repo and _GH_SHORT_RE.match(repo):
         return f"https://github.com/{repo.lstrip('/')}"
     return repo
+
 
 def _extract_repo_inputs(params: Dict[str, Any], runtime: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -77,6 +85,11 @@ def _extract_repo_inputs(params: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
         "sparse_globs": list(sparse_globs or []),
     }
 
+
+def _kinds(items: List[dict]) -> List[str]:
+    return sorted({(a or {}).get("kind", "") for a in items if isinstance(a, dict)})
+
+
 async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
     """
     Returns (artifacts, logs, extras). extras may include {"repo_path": "..."} for later steps.
@@ -101,7 +114,6 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
         }
         logs.append("clone.body=" + json.dumps(body_preview, separators=(",", ":")))
 
-        # Call the client; it adapts the body per endpoint and normalizes the URL again.
         resp = await gh.clone(
             repo_url=body_preview["repo_url"],
             landing_subdir=landing_subdir,
@@ -110,38 +122,36 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
             sparse_globs=body_preview["sparse_globs"],
         )
 
-        # fetcher returns {repository, ref, manifest, files[]} (no local path)
         repo_path = resp.get("path") or _lz(landing_zone=landing_zone, landing_subdir=landing_subdir, repo_tail="repo")
         commit_like = resp.get("commit") or resp.get("ref") or ""
 
         extras["repo_path"] = repo_path
         logs.append(f"clone: {repo_path}@{commit_like}")
 
-        # Build a local file manifest (if the checkout happened)
-        globs = inp["sparse_globs"] or ["**/*"]
+        globs_patterns = inp["sparse_globs"] or ["**/*"]
         matched: List[str] = []
-        for gpat in globs:
+        for gpat in globs_patterns:
             matched.extend(glob(str(Path(repo_path) / gpat), recursive=True))
         files = [str(Path(p).relative_to(repo_path)) for p in matched if Path(p).is_file()]
 
         repo_name = Path(repo_path).name
         artifacts.append({"kind": "cam.source.repository", "name": repo_name, "data": {"path": repo_path, "commit": commit_like}})
-        artifacts.append({"kind": "cam.source.manifest", "name": f"{repo_name} manifest", "data": {"count": len(files), "globs": globs}})
+        artifacts.append({"kind": "cam.source.manifest", "name": f"{repo_name} manifest", "data": {"count": len(files), "globs": globs_patterns}})
         for f in files:
             artifacts.append({"kind": "cam.source.file", "name": f, "data": {"path": f}})
         logs.append(f"manifest: files={len(files)}")
+        logs.append(f"kinds.emitted={_kinds(artifacts)}")
         return artifacts, logs, extras
 
     if tool_key == "tool.cobol.parse":
-        # Collect explicit program paths or discover them from repo_path + globs
         repo_path = (runtime.get("extras") or {}).get("repo_path")
-        globs = list(params.get("globs") or ["**/*.cbl", "**/*.CBL", "**/*.cob", "**/*.COB"])
+        globs_patterns = list(params.get("globs") or ["**/*.cbl", "**/*.CBL", "**/*.cob", "**/*.COB"])
         program_paths = list(params.get("program_paths") or [])
 
         if not program_paths:
             if repo_path:
                 matched: List[str] = []
-                for gpat in globs:
+                for gpat in globs_patterns:
                     matched.extend(glob(str(Path(repo_path) / gpat), recursive=True))
                 program_paths = [str(Path(p)) for p in matched if Path(p).is_file()]
                 logs.append(f"cobol.parse: discovered {len(program_paths)} program(s) via globs")
@@ -156,6 +166,7 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
         for it in items:
             artifacts.append({"kind": "cam.cobol.program", "name": it.get("name") or "COBOL Program", "data": it.get("data")})
         logs.append(f"cobol.parse: programs={len(items)}")
+        logs.append(f"kinds.emitted={_kinds(artifacts)}")
         return artifacts, logs, extras
 
     if tool_key == "tool.copybook.to_xml":
@@ -163,6 +174,7 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
         for it in (resp.get("items") or []):
             artifacts.append({"kind": "cam.cobol.copybook", "name": it.get("name") or "Copybook", "data": it.get("data")})
         logs.append(f"copybook.to_xml: items={len(artifacts)}")
+        logs.append(f"kinds.emitted={_kinds(artifacts)}")
         return artifacts, logs, extras
 
     if tool_key == "tool.cobol.flow":
@@ -170,6 +182,7 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
         if resp:
             artifacts.append({"kind": "cam.cobol.paragraph_flow", "name": "Paragraph Flow", "data": resp})
         logs.append("cobol.flow: done")
+        logs.append(f"kinds.emitted={_kinds(artifacts)}")
         return artifacts, logs, extras
 
     if tool_key == "tool.cobol.filemap":
@@ -177,17 +190,18 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
         if resp:
             artifacts.append({"kind": "cam.cobol.file_mapping", "name": "File I/O Mapping", "data": resp})
         logs.append("cobol.filemap: done")
+        logs.append(f"kinds.emitted={_kinds(artifacts)}")
         return artifacts, logs, extras
 
     if tool_key == "tool.jcl.parse":
         repo_path = (runtime.get("extras") or {}).get("repo_path")
-        globs = list(params.get("globs") or ["**/*.jcl", "**/*.JCL", "**/*.proc", "**/*.PROC"])
+        globs_patterns = list(params.get("globs") or ["**/*.jcl", "**/*.JCL", "**/*.proc", "**/*.PROC"])
         if not repo_path:
             logs.append("jcl.parse: missing repo_path (ensure tool.github.fetch ran earlier)")
             return artifacts, logs, extras
 
         matched: List[str] = []
-        for gpat in globs:
+        for gpat in globs_patterns:
             matched.extend(glob(str(Path(repo_path) / gpat), recursive=True))
         jcl_paths = [str(Path(p)) for p in matched if Path(p).is_file()]
 
@@ -203,17 +217,18 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
             artifacts.append({"kind": "cam.jcl.step", "name": name, "data": s})
 
         logs.append(f"jcl.parse: jobs={len(jobs)} steps={len(steps)}")
+        logs.append(f"kinds.emitted={_kinds(artifacts)}")
         return artifacts, logs, extras
 
     if tool_key == "tool.db2.usage":
         repo_path = (runtime.get("extras") or {}).get("repo_path")
-        globs = list(params.get("globs") or ["**/*.cbl", "**/*.CBL", "**/*.cob", "**/*.COB"])
+        globs_patterns = list(params.get("globs") or ["**/*.cbl", "**/*.CBL", "**/*.cob", "**/*.COB"])
         if not repo_path:
             logs.append("db2.usage: missing repo_path (ensure tool.github.fetch ran earlier)")
             return artifacts, logs, extras
 
         matched: List[str] = []
-        for gpat in globs:
+        for gpat in globs_patterns:
             matched.extend(glob(str(Path(repo_path) / gpat), recursive=True))
         prog_paths = [str(Path(p)) for p in matched if Path(p).is_file()]
 
@@ -224,6 +239,7 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
             artifacts.append({"kind": "cam.db2.table_usage", "name": pname, "data": it})
 
         logs.append(f"db2.usage: items={len(items)}")
+        logs.append(f"kinds.emitted={_kinds(artifacts)}")
         return artifacts, logs, extras
 
     logs.append(f"skip: unsupported tool '{tool_key}'")
