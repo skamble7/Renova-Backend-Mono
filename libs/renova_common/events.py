@@ -1,8 +1,9 @@
+#libs/renova_common/events.py
 from __future__ import annotations
 from enum import Enum
 
 # Canonical exchange for all Renova services
-EXCHANGE = "renova.events"
+EXCHANGE = "raina.events"
 
 class Service(str, Enum):
     CAPABILITY = "capability"

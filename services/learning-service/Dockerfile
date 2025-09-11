@@ -26,4 +26,4 @@ RUN pip install --no-cache-dir .
 COPY services/learning-service/app /app/app
 
 # 4) Run
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7113"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9013"]
