@@ -38,6 +38,7 @@ async def lifespan(app: FastAPI):
 
     db = await get_db()
 
+    # Build all Mongo indexes ONCE at startup (keep index creation out of request path)
     await artifact_dal.ensure_indexes(db)
     log.info("Mongo indexes ensured for artifacts")
 

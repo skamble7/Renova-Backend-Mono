@@ -1,6 +1,7 @@
 # services/artifact-service/app/services/registry_service.py
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -26,7 +27,6 @@ except Exception:  # pragma: no cover
     JSONSchemaValidationError = None  # type: ignore
 
 from app.dal.kind_registry_dal import (
-    ensure_registry_indexes,
     get_registry_meta,
     list_kinds,
     resolve_kind as dal_resolve_kind,
@@ -287,33 +287,48 @@ class KindRegistryService:
         self._etag: Optional[str] = None
         self._kinds: Dict[str, KindRegistryDoc] = {}
         self._aliases: Dict[str, str] = {}
+        # debounce / serialize refreshes under load
+        self._refresh_lock: asyncio.Lock = asyncio.Lock()
 
     async def refresh_cache(self, force: bool = False) -> None:
-        await ensure_registry_indexes(self.db)
+        """
+        Refresh the in-memory cache iff the registry ETag changed, serialized by a lock.
+        NOTE: index creation is handled at app startup; do NOT create indexes here.
+        """
         meta = await get_registry_meta(self.db)
         if (not force) and self._etag and meta.etag == self._etag:
             return
 
-        all_docs = await list_kinds(self.db, limit=2000)
-        kinds: Dict[str, KindRegistryDoc] = {}
-        aliases: Dict[str, str] = {}
-        for d in all_docs:
-            kd = KindRegistryDoc(**d)
-            kinds[kd.id] = kd
-            for a in kd.aliases or []:
-                aliases[a] = kd.id
+        async with self._refresh_lock:
+            # double-check after acquiring the lock
+            meta2 = await get_registry_meta(self.db)
+            if (not force) and self._etag and meta2.etag == self._etag:
+                return
 
-        self._kinds = kinds
-        self._aliases = aliases
+            all_docs = await list_kinds(self.db, limit=2000)
+            kinds: Dict[str, KindRegistryDoc] = {}
+            aliases: Dict[str, str] = {}
+            for d in all_docs:
+                kd = KindRegistryDoc(**d)
+                kinds[kd.id] = kd
+                for a in kd.aliases or []:
+                    aliases[a] = kd.id
 
-        if self._etag and meta.etag != self._etag:
-            try:
-                _validator_cache.clear()
-                log.info("Validator cache cleared due to registry ETag change (old=%s, new=%s)", self._etag, meta.etag)
-            except Exception:
-                log.exception("Failed to clear validator cache on registry refresh")
+            self._kinds = kinds
+            self._aliases = aliases
 
-        self._etag = meta.etag
+            if self._etag and meta2.etag != self._etag:
+                try:
+                    _validator_cache.clear()
+                    log.info(
+                        "Validator cache cleared due to registry ETag change (old=%s, new=%s)",
+                        self._etag,
+                        meta2.etag,
+                    )
+                except Exception:
+                    log.exception("Failed to clear validator cache on registry refresh")
+
+            self._etag = meta2.etag
 
     async def _get_kind_doc(self, kind_or_alias: str) -> Optional[KindRegistryDoc]:
         await self.refresh_cache()
@@ -405,8 +420,10 @@ class KindRegistryService:
             safety_counter += 1
             entry = await get_schema_version_entry(self.db, kd.id, version=cur_version)
             if not entry:
-                log.warning("Missing migrator step for %s from=%s → to=%s; stopping partial migration.",
-                            kd.id, cur_version, target)
+                log.warning(
+                    "Missing migrator step for %s from=%s → to=%s; stopping partial migration.",
+                    kd.id, cur_version, target
+                )
                 break
             next_version = None
             for mig in (entry.get("migrators") or []):
