@@ -1,11 +1,15 @@
-from fastapi import FastAPI, HTTPException, Request
-from .models import ParseIn, ParseOut, CopybookIn, CopybookOut
-from .runner import run_proleap, run_cb2xml, JarError
 import os
 import logging
-from typing import Dict, Any, List
-from uuid import uuid4
 import shutil
+import time
+from uuid import uuid4
+from typing import Dict, Any, List
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import ORJSONResponse
+
+from .models import ParseIn, ParseOut, CopybookIn, CopybookOut
+from .runner import run_proleap, run_cb2xml, JarError
 
 logger = logging.getLogger("proleap.api")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -13,7 +17,11 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 PROLEAP_JAR = os.getenv("PROLEAP_JAR", "/opt/jars/proleap-cli.jar")
 CB2XML_JAR  = os.getenv("CB2XML_JAR",  "/opt/jars/cb2xml.jar")
 
-app = FastAPI(title="COBOL Parser (ProLeap + cb2xml)", version="1.0.0")
+app = FastAPI(
+    title="COBOL Parser (ProLeap + cb2xml)",
+    version="1.0.0",
+    default_response_class=ORJSONResponse,
+)
 
 
 def _exists(p: str) -> bool:
@@ -38,7 +46,6 @@ def health() -> Dict[str, Any]:
         "cb2xml_jar": CB2XML_JAR,
         "cb2xml_jar_exists": _exists(CB2XML_JAR),
     }
-    # If any critical asset missing, still 200 but with ok=False to avoid failing eager health checks
     if not java_path or not _exists(PROLEAP_JAR) or not _exists(CB2XML_JAR):
         info["ok"] = False
     return info
@@ -54,22 +61,39 @@ def _summarize_sources(sources: List[str]) -> Dict[str, Any]:
 @app.post("/parse", response_model=ParseOut)
 def parse(body: ParseIn, request: Request):
     req_id = str(uuid4())
+    t0 = time.perf_counter()
     summary = _summarize_sources(body.sources)
     logger.info("parse IN req=%s dialect=%s sources=%s", req_id, body.dialect, summary)
 
+    # short-circuit empty to keep the pipeline happy
+    if not body.sources:
+        meta = {"req_id": req_id, "duration_s": round(time.perf_counter() - t0, 4)}
+        logger.info("parse OK (empty) req=%s", req_id)
+        return {"programs": [], "errors": [], "meta": meta}
+
     try:
         programs = run_proleap(PROLEAP_JAR, body.sources, body.dialect)
+        meta = {"req_id": req_id, "duration_s": round(time.perf_counter() - t0, 4)}
         logger.info("parse OK req=%s programs=%d", req_id, len(programs))
-        return {"programs": programs}
+        return {"programs": programs, "errors": [], "meta": meta}
     except JarError as e:
-        # Log full details server-side, return concise message to client
+        # Return a 200 with structured error so upstream can continue gracefully
+        meta = {"req_id": req_id, "duration_s": round(time.perf_counter() - t0, 4)}
         logger.exception("parse JarError req=%s: %s", req_id, e)
-        detail = {"error": "proleap failed", "message": str(e), "req_id": req_id}
-        raise HTTPException(status_code=500, detail=detail)
+        return {
+            "programs": [],
+            "errors": [{"stage": "proleap", "message": str(e)}],
+            "meta": meta,
+        }
     except Exception as e:
+        # Unexpected: keep the pipeline alive but surface the problem
+        meta = {"req_id": req_id, "duration_s": round(time.perf_counter() - t0, 4)}
         logger.exception("parse unexpected error req=%s", req_id)
-        detail = {"error": "unexpected", "message": str(e), "req_id": req_id}
-        raise HTTPException(status_code=500, detail=detail)
+        return {
+            "programs": [],
+            "errors": [{"stage": "server", "message": str(e)}],
+            "meta": meta,
+        }
 
 
 # Aliases so clients that try versioned paths won't 404
@@ -86,19 +110,35 @@ def parse_api_v1(body: ParseIn, request: Request):
 @app.post("/copybook_to_xml", response_model=CopybookOut)
 def copybook_to_xml(body: CopybookIn, request: Request):
     req_id = str(uuid4())
+    t0 = time.perf_counter()
     logger.info("copybook_to_xml IN req=%s count=%d", req_id, len(body.copybooks or []))
+
+    if not body.copybooks:
+        meta = {"req_id": req_id, "duration_s": round(time.perf_counter() - t0, 4)}
+        logger.info("copybook_to_xml OK (empty) req=%s", req_id)
+        return {"xmlDocs": [], "errors": [], "meta": meta}
+
     try:
         xml_docs = run_cb2xml(CB2XML_JAR, body.copybooks)
+        meta = {"req_id": req_id, "duration_s": round(time.perf_counter() - t0, 4)}
         logger.info("copybook_to_xml OK req=%s docs=%d", req_id, len(xml_docs))
-        return {"xmlDocs": xml_docs}
+        return {"xmlDocs": xml_docs, "errors": [], "meta": meta}
     except JarError as e:
+        meta = {"req_id": req_id, "duration_s": round(time.perf_counter() - t0, 4)}
         logger.exception("copybook_to_xml JarError req=%s: %s", req_id, e)
-        detail = {"error": "cb2xml failed", "message": str(e), "req_id": req_id}
-        raise HTTPException(status_code=500, detail=detail)
+        return {
+            "xmlDocs": [],
+            "errors": [{"stage": "cb2xml", "message": str(e)}],
+            "meta": meta,
+        }
     except Exception as e:
+        meta = {"req_id": req_id, "duration_s": round(time.perf_counter() - t0, 4)}
         logger.exception("copybook_to_xml unexpected error req=%s", req_id)
-        detail = {"error": "unexpected", "message": str(e), "req_id": req_id}
-        raise HTTPException(status_code=500, detail=detail)
+        return {
+            "xmlDocs": [],
+            "errors": [{"stage": "server", "message": str(e)}],
+            "meta": meta,
+        }
 
 
 # Aliases for copybook endpoint as well (optional)

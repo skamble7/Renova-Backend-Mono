@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Dict
+from typing import List, Dict, Optional, Any
 
 # ---- Inputs
 class ParseIn(BaseModel):
@@ -11,7 +11,11 @@ class CopybookIn(BaseModel):
 
 # ---- Outputs
 class ParseOut(BaseModel):
-    programs: List[Dict]  # JSON AST/ASG per program
+    programs: List[Dict]                         # JSON AST/ASG per program (or minimal summaries)
+    errors: Optional[List[Dict[str, Any]]] = None  # Per-file or batch errors (non-fatal)
+    meta: Optional[Dict[str, Any]] = None          # Timing, sizes, diagnostics
 
 class CopybookOut(BaseModel):
-    xmlDocs: List[str]    # cb2xml XML strings, one per input
+    xmlDocs: List[str]                           # cb2xml XML strings, one per input
+    errors: Optional[List[Dict[str, Any]]] = None
+    meta: Optional[Dict[str, Any]] = None

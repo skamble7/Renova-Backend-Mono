@@ -8,7 +8,6 @@ from app.clients import artifact_service
 
 log = logging.getLogger("app.executor.executor")
 
-
 async def _persist(workspace_id: str, run_id: str, generated: List[Dict[str, Any]]) -> List[str]:
     if not generated:
         return []
@@ -34,14 +33,12 @@ async def _persist(workspace_id: str, run_id: str, generated: List[Dict[str, Any
     log.info("persist.batch", extra={"count": len(ids)})
     return ids
 
-
 def _requires_satisfied(snapshot: Dict[str, Any], required_kinds: List[str]) -> bool:
     if not required_kinds:
         return True
     arts = snapshot.get("artifacts") or []
     present = {a.get("kind") for a in arts if isinstance(a, dict)}
     return all(k in present for k in required_kinds)
-
 
 async def execute_playbook(*, workspace_id: str, workspace_name: str, playbook: Dict[str, Any], tool_params: Dict[str, Any], run_id: str) -> Dict[str, Any]:
     """
@@ -75,6 +72,7 @@ async def execute_playbook(*, workspace_id: str, workspace_name: str, playbook: 
             params.setdefault("sparse_globs", tool_params.get("sparse_globs", []))
 
         try:
+            log.info("execute_playbook.step", extra={"step": sid, "cap": cap})
             arts, tlogs, _extras = await run_tool(cap, params, runtime)
             logs.extend([f"{sid}: {m}" for m in tlogs])
 

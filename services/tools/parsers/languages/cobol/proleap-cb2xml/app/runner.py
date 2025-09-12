@@ -5,7 +5,8 @@ import pathlib
 import logging
 import os
 import shutil
-from typing import List
+import time
+from typing import List, Tuple
 
 logger = logging.getLogger("proleap.runner")
 
@@ -20,10 +21,16 @@ def _exists(p: str) -> bool:
         return False
 
 
-def _run_java(jar_path: str, args: list[str]) -> str:
+def _run_java(jar_path: str, args: list[str]) -> Tuple[str, str, int]:
+    """
+    Run a jar and return (stdout, stderr, rc).
+    We DO NOT raise here; callers decide whether to treat nonzero as fatal.
+    """
     java_path = shutil.which("java")
-    logger.info("java check: found=%s path=%s jar=%s exists=%s",
-                bool(java_path), java_path, jar_path, _exists(jar_path))
+    logger.info(
+        "java check: found=%s path=%s jar=%s exists=%s",
+        bool(java_path), java_path, jar_path, _exists(jar_path)
+    )
 
     if not java_path:
         raise JarError("Java runtime not found in PATH")
@@ -34,38 +41,29 @@ def _run_java(jar_path: str, args: list[str]) -> str:
     cmd = [java_path, "-jar", jar_path, *args]
     logger.info("exec: %s", " ".join(cmd))
 
-    try:
-        res = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        stdout = (res.stdout or "").strip()
-        if stdout:
-            # log only a head for very large outputs
-            logger.debug("exec stdout (head 500): %s", stdout[:500])
-        if res.stderr:
-            logger.debug("exec stderr (head 500): %s", res.stderr[:500])
-        return res.stdout
-    except subprocess.CalledProcessError as e:
-        out = (e.stdout or "").strip()
-        err = (e.stderr or "").strip()
-        # Truncate to avoid blowing up logs
-        out_h = out[:2000]
-        err_h = err[:2000]
-        logger.error("exec failed rc=%s\nSTDOUT(head): %s\nSTDERR(head): %s", e.returncode, out_h, err_h)
-        # Prefer stderr content for error detail
-        msg = err or out or str(e)
-        raise JarError(msg) from e
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    out = (res.stdout or "").strip()
+    err = (res.stderr or "").strip()
+    if out:
+        logger.debug("exec stdout (head 500): %s", out[:500])
+    if err:
+        logger.debug("exec stderr (head 500): %s", err[:500])
+    return out, err, res.returncode
 
 
 def run_proleap(proleap_jar: str, sources: List[str], dialect: str) -> list[dict]:
     """
     Write each source to a temp file and call the proleap-cli.jar.
     The CLI is expected to output JSON like: {"programs":[{...}, ...]}
+    Robust to empty/non-JSON output; raises JarError with context for the API layer to decide.
     """
+    t0 = time.perf_counter()
     logger.info("run_proleap: dialect=%s sources=%d", dialect, len(sources or []))
+
+    if not sources:
+        logger.info("run_proleap: empty sources -> returning []")
+        return []
+
     with tempfile.TemporaryDirectory() as td:
         td = pathlib.Path(td)
         files = []
@@ -76,10 +74,24 @@ def run_proleap(proleap_jar: str, sources: List[str], dialect: str) -> list[dict
             files.append(str(p))
         logger.info("run_proleap: temp_files=%s", files)
 
-        out = _run_java(proleap_jar, ["--dialect", dialect, "--format", "json", *files])
-        data = json.loads(out) if (out or "").strip() else {}
+        out, err, rc = _run_java(proleap_jar, ["--dialect", dialect, "--format", "json", *files])
+
+        if rc != 0:
+            # Prefer stderr for context
+            msg = (err or out or f"proleap-cli exited rc={rc}")[:2000]
+            raise JarError(msg)
+
+        if not out:
+            raise JarError("proleap-cli produced empty output")
+
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            head = out[:2000]
+            raise JarError(f"proleap-cli returned non-JSON (head): {head}")
+
         programs = data.get("programs", [])
-        logger.info("run_proleap: parsed programs=%d", len(programs))
+        logger.info("run_proleap: parsed programs=%d (%.3fs)", len(programs), time.perf_counter() - t0)
         return programs
 
 
@@ -88,7 +100,13 @@ def run_cb2xml(cb2xml_jar: str, copybooks: List[str]) -> list[str]:
     Convert each copybook to XML using cb2xml CLI:
       java -jar cb2xml.jar -c <copybook> -o <out.xml>
     """
+    t0 = time.perf_counter()
     logger.info("run_cb2xml: copybooks=%d", len(copybooks or []))
+
+    if not copybooks:
+        logger.info("run_cb2xml: empty copybooks -> returning []")
+        return []
+
     with tempfile.TemporaryDirectory() as td:
         td = pathlib.Path(td)
         xmls: list[str] = []
@@ -96,7 +114,11 @@ def run_cb2xml(cb2xml_jar: str, copybooks: List[str]) -> list[str]:
             src = td / f"cpy{i}.cpy"
             out = td / f"cpy{i}.xml"
             src.write_text(content or "", encoding="utf-8", errors="ignore")
-            _run_java(cb2xml_jar, ["-c", str(src), "-o", str(out)])
+            _out, _err, rc = _run_java(cb2xml_jar, ["-c", str(src), "-o", str(out)])
+            if rc != 0:
+                # Let the API layer accumulate non-fatal errors if desired
+                raise JarError((_err or _out or f"cb2xml exited rc={rc}")[:2000])
             xmls.append(out.read_text(encoding="utf-8", errors="ignore"))
-        logger.info("run_cb2xml: produced xml_docs=%d", len(xmls))
+
+        logger.info("run_cb2xml: produced xml_docs=%d (%.3fs)", len(xmls), time.perf_counter() - t0)
         return xmls

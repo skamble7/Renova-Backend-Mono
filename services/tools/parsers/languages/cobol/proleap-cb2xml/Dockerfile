@@ -1,4 +1,3 @@
-# services/tools/parsers/languages/cobol/proleap-cb2xml/Dockerfile
 # --- Stage 1: build the tiny Java CLI -------------------------------
 FROM openjdk:21-jdk-slim AS cli-build
 WORKDIR /build
@@ -27,7 +26,9 @@ WORKDIR /svc
 
 # Python deps
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Ensure FastAPI + Uvicorn + orjson are always present
+RUN pip install --no-cache-dir -r requirements.txt \
+ && pip install --no-cache-dir fastapi uvicorn orjson
 
 # App code
 COPY app/ app/

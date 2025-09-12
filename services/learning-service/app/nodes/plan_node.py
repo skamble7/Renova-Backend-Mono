@@ -7,6 +7,8 @@ import json, logging
 
 log = logging.getLogger("app.nodes.plan_node")
 
+def _clip(s: str, n: int = 2000) -> str:
+    return s if len(s) <= n else s[: n - 3] + "..."
 
 def _norm_step(s: dict) -> dict:
     # keep ids and tool_key/capability_id; normalize optional lists
@@ -19,7 +21,6 @@ def _norm_step(s: dict) -> dict:
         "emits": s.get("emits") or [],
         "requires_kinds": s.get("requires_kinds") or [],
     }
-
 
 async def plan_node(state: LearningState) -> LearningState:
     steps = [_norm_step(s) for s in (state.get("plan", {}).get("steps") or [])]
@@ -45,7 +46,11 @@ async def plan_node(state: LearningState) -> LearningState:
             },
         ]
         log.info("plan.enrich.request", extra={"steps": len(steps)})
+        log.debug("plan.enrich.messages", extra={"system_head": _clip(messages[0]["content"]), "user_head": _clip(messages[1]["content"])})
+
         content = await provider.chat_json(messages)
+        log.debug("plan.enrich.raw_content", extra={"len": len(content or ""), "head": _clip(content or "")})
+
         proposed = json.loads(content) if isinstance(content, str) else (content or {})
         param_overrides = {s["id"]: (s.get("params") or {}) for s in (proposed.get("steps") or []) if s.get("id")}
         applied = 0

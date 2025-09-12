@@ -14,11 +14,9 @@ from app.config import settings
 
 log = logging.getLogger("app.executor.tool_runner")
 
-
 def _lz(*, landing_zone: str, landing_subdir: str, repo_tail: str = "") -> str:
     base = PurePosixPath(landing_zone) / landing_subdir
     return str(base / repo_tail) if repo_tail else str(base)
-
 
 def _first(*vals):
     for v in vals:
@@ -29,9 +27,7 @@ def _first(*vals):
         return v
     return None
 
-
 _GH_SHORT_RE = re.compile(r"^[\w\-.]+/[\w\-.]+(?:\.git)?$")
-
 
 def _normalize_repo_url(repo: str) -> str:
     repo = (repo or "").strip()
@@ -46,13 +42,9 @@ def _normalize_repo_url(repo: str) -> str:
         return f"https://github.com/{repo.lstrip('/')}"
     return repo
 
-
 def _extract_repo_inputs(params: Dict[str, Any], runtime: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Accept flexible forms:
-      params.repo (str or {repo_url, ref, depth, sparse_globs})
-      params.repo_url (str)
-      runtime fallbacks: runtime.run.repo.repo_url, runtime.repo.repo_url, etc.
+    Accept flexible forms...
     """
     repo_param = params.get("repo")
     repo_url_param = params.get("repo_url")
@@ -85,10 +77,8 @@ def _extract_repo_inputs(params: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
         "sparse_globs": list(sparse_globs or []),
     }
 
-
 def _kinds(items: List[dict]) -> List[str]:
     return sorted({(a or {}).get("kind", "") for a in items if isinstance(a, dict)})
-
 
 async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
     """
@@ -113,6 +103,7 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
             "landing_subdir": landing_subdir,  # client maps to workspace for /fetch
         }
         logs.append("clone.body=" + json.dumps(body_preview, separators=(",", ":")))
+        log.info("tool_runner.github.fetch", extra={"repo_url": body_preview["repo_url"], "ref": body_preview["ref"]})
 
         resp = await gh.clone(
             repo_url=body_preview["repo_url"],
@@ -158,6 +149,7 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
             else:
                 logs.append("cobol.parse: no program_paths provided and missing repo_path (ensure tool.github.fetch ran earlier)")
 
+        log.info("tool_runner.cobol.parse.request", extra={"program_paths": len(program_paths)})
         resp = await proleap.parse_programs(
             program_paths=program_paths,
             dialect=str(params.get("dialect") or "ANSI85"),
@@ -170,6 +162,7 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
         return artifacts, logs, extras
 
     if tool_key == "tool.copybook.to_xml":
+        log.info("tool_runner.copybook.to_xml.request", extra={"count": len(list(params.get("copybooks") or []))})
         resp = await proleap.copybook_to_xml(copybooks=list(params.get("copybooks") or []), encoding=params.get("encoding"))
         for it in (resp.get("items") or []):
             artifacts.append({"kind": "cam.cobol.copybook", "name": it.get("name") or "Copybook", "data": it.get("data")})
@@ -205,6 +198,7 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
             matched.extend(glob(str(Path(repo_path) / gpat), recursive=True))
         jcl_paths = [str(Path(p)) for p in matched if Path(p).is_file()]
 
+        log.info("tool_runner.jcl.parse.request", extra={"jcl_paths": len(jcl_paths)})
         resp = await parser_jcl.parse(paths=jcl_paths)
         jobs = resp.get("jobs") or []
         steps = resp.get("steps") or []
@@ -232,6 +226,7 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
             matched.extend(glob(str(Path(repo_path) / gpat), recursive=True))
         prog_paths = [str(Path(p)) for p in matched if Path(p).is_file()]
 
+        log.info("tool_runner.db2.usage.request", extra={"program_paths": len(prog_paths)})
         resp = await analyzer_db2.usage(program_paths=prog_paths)
         items = resp.get("items") or []
         for it in items:
@@ -243,4 +238,5 @@ async def run_tool(tool_key: str, params: Dict[str, Any], runtime: Dict[str, Any
         return artifacts, logs, extras
 
     logs.append(f"skip: unsupported tool '{tool_key}'")
+    log.info("tool_runner.skip", extra={"tool": tool_key})
     return artifacts, logs, extras
