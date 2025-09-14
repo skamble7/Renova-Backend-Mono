@@ -2,614 +2,835 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from app.dal.kind_registry_dal import upsert_kind
 
 LATEST = "1.0.0"
 
 # ─────────────────────────────────────────────────────────────
-# Canonical list of kinds for COBOL modernization (Core + Nice + Diagrams)
+# Canonical seed docs (exactly as specified by the user)
 # ─────────────────────────────────────────────────────────────
-ALL_KINDS: List[str] = [
-    # ── Source / SCM
-    "cam.source.repository",
-    "cam.source.manifest",
-    "cam.source.file",
-
-    # ── COBOL code understanding
-    "cam.cobol.program",
-    "cam.cobol.copybook",
-    "cam.cobol.paragraph_flow",
-    "cam.cobol.file_mapping",
-
-    # ── Generic code analysis (language-agnostic)
-    "cam.code.call_hierarchy",
-    "cam.code.interface",
-
-    # ── Data access
-    "cam.db2.table_usage",
-    "cam.vsam.cluster",
-
-    # ── JCL / workflow
-    "cam.jcl.job",
-    "cam.jcl.step",
-    "cam.workflow.job_flow",
-    "cam.workflow.scheduling",
-
-    # ── Domain / rules
-    "cam.domain.business_rules",
-
-    # ── Nice-to-have data structure & usage
-    "cam.data.legacy_structure",
-    "cam.data.usage_matrix",
-
-    # ── Mapping (legacy → modern)
-    "cam.mapping.program_to_service",
-    "cam.mapping.job_to_process",
-    "cam.mapping.data_to_entity",
-    "cam.mapping.legacy_to_modern",
-
-    # ── Diagrams (renderer-agnostic, with optional rendered text)
-    "cam.diagram.system_context",
-    "cam.diagram.container_view",
-    "cam.diagram.component_view",
-    "cam.diagram.deployment_view",
-    "cam.diagram.job_flow",
-    "cam.diagram.call_graph",
-    "cam.diagram.data_flow",
-    "cam.diagram.er",
-]
-
-# ─────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────
-def category_of(kind: str) -> str:
-    return kind.split(".")[1] if kind.count(".") >= 2 else "misc"
-
-def artifact_of(kind: str) -> str:
-    return kind.split(".")[-1]
-
-def _string_id():
-    return {"type": "string", "minLength": 1}
-
-def _name_desc():
-    return {"name": {"type": "string", "minLength": 1}, "description": {"type": "string"}}
-
-# ─────────────────────────────────────────────────────────────
-# Diagram schema (notation + nodes/edges; optional rendered form)
-# ─────────────────────────────────────────────────────────────
-DIAGRAM_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "notation": {"type": "string", "enum": ["c4", "mermaid", "plantuml", "dot", "drawio"]},
-        "name": {"type": "string"},
-        "nodes": {
-            "type": "array",
-            "items": {
+KIND_DOCS: List[Dict[str, Any]] = [
+    {
+        "_id": "cam.asset.repo_snapshot",
+        "title": "Repository Snapshot",
+        "summary": "Commit-level trace for the cloned source repo used in a learning run.",
+        "category": "generic",
+        "aliases": ["cam.asset.git_snapshot"],
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
                 "type": "object",
                 "additionalProperties": False,
+                "required": ["repo", "commit", "branch", "paths_root"],
                 "properties": {
-                    "id": _string_id(),
-                    "label": {"type": "string"},
-                    "type": {"type": "string"},
-                    "props": {"type": "object"},
-                },
-                "required": ["id", "label"],
-            },
-        },
-        "edges": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "from": _string_id(),
-                    "to": _string_id(),
-                    "label": {"type": "string"},
-                    "props": {"type": "object"},
-                },
-                "required": ["from", "to"],
-            },
-        },
-        "legend": {"type": "string"},
-        "layout_hint": {"type": "string"},
-        "rendered": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "language": {"type": "string"},
-                "content": {"type": "string"},
-            },
-            "required": ["language", "content"],
-        },
-    },
-    "required": ["notation", "nodes", "edges"],
-}
-
-# ─────────────────────────────────────────────────────────────
-# Schemas
-# ─────────────────────────────────────────────────────────────
-def schema_for(kind: str) -> Dict[str, Any]:
-    # Diagrams (all share the same base schema)
-    if kind.startswith("cam.diagram."):
-        return DIAGRAM_SCHEMA
-
-    # ── Source / SCM
-    if kind == "cam.source.repository":
-        return {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "repo": {"type": "string"},                  # e.g., https://github.com/org/repo
-                "path": {"type": "string"},                  # local path in landing zone
-                "commit": {"type": "string"},                # commit/sha or resolved ref
-                "ref": {"type": "string"},                   # requested ref/branch/tag
-            },
-            "required": ["repo", "path", "commit"],
-        }
-    if kind == "cam.source.manifest":
-        return {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "repo": {"type": "string"},
-                "ref": {"type": "string"},
-                "files": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["repo", "files"],
-        }
-    if kind == "cam.source.file":
-        return {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "repo": {"type": "string"},
-                "ref": {"type": "string"},
-                "path": {"type": "string"},                  # path relative to repo root
-                "sha": {"type": "string"},
-                "size": {"type": "integer", "minimum": 0},
-            },
-            "required": ["repo", "path"],
-        }
-
-    # ── COBOL
-    if kind == "cam.cobol.program":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{
-                "program_id":{"type":"string"},
-                "division":{"type":"object","additionalProperties":False,"properties":{
-                    "identification":{"type":"object"},
-                    "environment":{"type":"object"},
-                    "data":{"type":"object"},
-                    "procedure":{"type":"object"}
-                }},
-                "io":{"type":"object","additionalProperties":False,"properties":{
-                    "files":{"type":"array","items":{"type":"string"}},
-                    "db2_tables":{"type":"array","items":{"type":"string"}},
-                    "queues":{"type":"array","items":{"type":"string"}}
-                }},
-                "calls":{"type":"array","items":{"type":"string"}},
-                "paragraphs":{"type":"array","items":{"type":"string"}},
-                "metrics":{"type":"object","properties":{"loc":{"type":"integer"}},"additionalProperties":False}
-            },
-            "required":["program_id"]
-        }
-    if kind == "cam.cobol.copybook":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{
-                "name":{"type":"string"},
-                "raw":{"type":"string"},
-                "fields":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                    "level":{"type":"integer"},
-                    "name":{"type":"string"},
-                    "pic":{"type":"string"},
-                    "occurs":{"type":"integer"},
-                    "redefines":{"type":"string"}
-                },"required":["level","name"]}}
-            },
-            "required":["name","raw"]
-        }
-    if kind == "cam.cobol.paragraph_flow":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{
-                "program":{"type":"string"},
-                "nodes":{"type":"array","items":{"type":"string"}},
-                "edges":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                    "from":{"type":"string"}, "to":{"type":"string"}, "label":{"type":"string"}
-                },"required":["from","to"]}}
-            },
-            "required":["program","nodes","edges"]
-        }
-    if kind == "cam.cobol.file_mapping":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{
-                "program":{"type":"string"},
-                "files":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                    "ddname":{"type":"string"},
-                    "dataset":{"type":"string"},
-                    "vsam_cluster":{"type":"string"},
-                    "access":{"type":"string"}
-                },"required":["ddname"]}}
-            },
-            "required":["program","files"]
-        }
-
-    # ── Generic code analysis
-    if kind == "cam.code.call_hierarchy":
-        return {
-            "type": "object", "additionalProperties": False,
-            "properties": {
-                "nodes": {"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                    "id": _string_id(), "program":{"type":"string"}
-                },"required":["id","program"]}},
-                "edges": {"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                    "from": _string_id(), "to": _string_id(), "type":{"type":"string","default":"call"}
-                },"required":["from","to"]}}
-            },
-            "required": ["nodes","edges"]
-        }
-    if kind == "cam.code.interface":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{
-                "program":{"type":"string"},
-                "inputs":{"type":"array","items":{"type":"string"}},    # params/files/tables
-                "outputs":{"type":"array","items":{"type":"string"}},
-                "return_codes":{"type":"array","items":{"type":"string"}}
-            },
-            "required":["program"]
-        }
-
-    # ── Data access
-    if kind == "cam.db2.table_usage":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{"tables":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                "name":{"type":"string"},
-                "ops":{"type":"array","items":{"type":"string"}}  # SELECT/INSERT/UPDATE/DELETE
-            },"required":["name"]}}},
-            "required":["tables"]
-        }
-    if kind == "cam.vsam.cluster":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{"name":{"type":"string"},
-                "dataset":{"type":"string"},
-                "record_format":{"type":"string"},
-                "key":{"type":"object","properties":{"field":{"type":"string"},"length":{"type":"integer"}},"additionalProperties":False}},
-            "required":["name"]
-        }
-
-    # ── JCL / workflow
-    if kind == "cam.jcl.job":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{"jobname":{"type":"string"},"account":{"type":"string"},
-                "class":{"type":"string"},"message_class":{"type":"string"},
-                "steps":{"type":"array","items":{"type":"string"}}},
-            "required":["jobname"]
-        }
-    if kind == "cam.jcl.step":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{
-                "stepname":{"type":"string"},
-                "program":{"type":"string"},
-                "proc_ref":{"type":"string"},
-                "params":{"type":"array","items":{"type":"string"}},
-                "dd":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                    "ddname":{"type":"string"},
-                    "dataset":{"type":"string"},
-                    "disp":{"type":"string"},
-                    "dcb":{"type":"string"}
-                },"required":["ddname"]}}
-            },
-            "required":["stepname"]
-        }
-    if kind == "cam.workflow.job_flow":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{
-                "nodes":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                    "id": _string_id(), "label":{"type":"string"}, "type":{"type":"string"}  # job/step
-                },"required":["id","label"]}},
-                "edges":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                    "from": _string_id(), "to": _string_id(), "label":{"type":"string"}
-                },"required":["from","to"]}}
-            },
-            "required":["nodes","edges"]
-        }
-    if kind == "cam.workflow.scheduling":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{
-                "triggers":{"type":"array","items":{"type":"string"}},    # cron or descriptors
-                "calendars":{"type":"array","items":{"type":"string"}},
-                "predecessors":{"type":"array","items":{"type":"string"}},# job names/ids
-                "windows":{"type":"array","items":{"type":"string"}}      # maintenance/business windows
-            }
-        }
-
-    # ── Domain / rules
-    if kind == "cam.domain.business_rules":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{"rules":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                "id": _string_id(),
-                "name":{"type":"string"},
-                "statement":{"type":"string"},
-                "logic":{"type":"string"},
-                "source_references":{"type":"array","items":{"type":"string"}},
-                "impacts":{"type":"array","items":{"type":"string"}},
-                "confidence":{"type":"number","minimum":0,"maximum":1}
-            },"required":["id","name","statement"]}}},
-            "required":["rules"]
-        }
-
-    # ── Data structure & usage
-    if kind == "cam.data.legacy_structure":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{
-                "name":{"type":"string"},
-                "records":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                    "name":{"type":"string"},
-                    "fields":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                        "level":{"type":"integer"},"name":{"type":"string"},
-                        "pic":{"type":"string"},"occurs":{"type":"integer"},
-                        "redefines":{"type":"string"}
-                    },"required":["name"]}}
-                },"required":["name"]}}
-            },
-            "required":["name","records"]
-        }
-    if kind == "cam.data.usage_matrix":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{"rows":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                "program":{"type":"string"},
-                "element":{"type":"string"},
-                "operation":{"type":"string"}  # read/update/delete
-            },"required":["program","element","operation"]}}},
-            "required":["rows"]
-        }
-
-    # ── Mapping (legacy → modern)
-    if kind == "cam.mapping.program_to_service":
-        return {
-            "type": "object", "additionalProperties": False,
-            "properties": {
-                "links": {
-                    "type": "array",
-                    "items": {
-                        "type": "object", "additionalProperties": False,
-                        "properties": {
-                            "program": {"type": "string"},
-                            "service": {"type": "string"},
-                            "rationale": {"type": "string"},
-                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                        },
-                        "required": ["program", "service"],
-                    },
+                    "repo": {"type": "string", "description": "Remote URL or origin name"},
+                    "commit": {"type": "string"},
+                    "branch": {"type": "string"},
+                    "paths_root": {"type": "string", "description": "Filesystem mount/volume path used by tools"},
+                    "tags": {"type": "array", "items": {"type": "string"}}
                 }
             },
-            "required": ["links"],
-        }
-    if kind == "cam.mapping.job_to_process":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{
-                "nodes":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                    "id": _string_id(),"label":{"type":"string"},"type":{"type":"string"}
-                },"required":["id","label"]}},
-                "edges":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                    "from": _string_id(),"to": _string_id(),"label":{"type":"string"}
-                },"required":["from","to"]}}
+            "additional_props_policy": "forbid",
+            "prompt": {
+                "system": "Validate and normalize a Git snapshot into strict JSON. Do not invent fields.",
+                "strict_json": True
             },
-            "required":["nodes","edges"]
-        }
-    if kind == "cam.mapping.data_to_entity":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{"mappings":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                "source":{"type":"string"},
-                "target":{"type":"string"},
-                "transform":{"type":"string"},
-                "notes":{"type":"string"},
-                "confidence":{"type":"number","minimum":0,"maximum":1}
-            },"required":["source","target"]}}},
-            "required":["mappings"]
-        }
-    if kind == "cam.mapping.legacy_to_modern":
-        return {
-            "type":"object","additionalProperties":False,
-            "properties":{"links":{"type":"array","items":{"type":"object","additionalProperties":False,"properties":{
-                "legacy":{"type":"string"},
-                "modern":{"type":"string"},
-                "rationale":{"type":"string"},
-                "confidence":{"type":"number","minimum":0,"maximum":1}
-            },"required":["legacy","modern"]}}}
-        }
-
-    # Fallback
-    return {"type": "object", "additionalProperties": False}
-
-# ─────────────────────────────────────────────────────────────
-# Identity rules
-# ─────────────────────────────────────────────────────────────
-def identity_for(kind: str) -> Dict[str, Any]:
-    # Diagrams
-    if kind.startswith("cam.diagram."):
-        return {"natural_key": ["name"]}
-
-    # Source / SCM
-    if kind == "cam.source.repository":
-        return {"natural_key": ["repo", "commit"]}            # one per repo@commit
-    if kind == "cam.source.manifest":
-        return {"natural_key": ["repo", "ref"]}
-    if kind == "cam.source.file":
-        return {"natural_key": ["repo", "ref", "path"]}
-
-    # Code & analysis
-    if kind in ("cam.cobol.program", "cam.cobol.copybook", "cam.cobol.paragraph_flow",
-                "cam.cobol.file_mapping", "cam.code.call_hierarchy", "cam.code.interface"):
-        return {"natural_key": ["name"]}
-
-    # Data access
-    if kind in ("cam.db2.table_usage", "cam.vsam.cluster"):
-        return {"natural_key": ["name"]}
-
-    # JCL / workflow
-    if kind in ("cam.jcl.job", "cam.jcl.step", "cam.workflow.job_flow", "cam.workflow.scheduling"):
-        return {"natural_key": ["name"]}
-
-    # Domain / rules
-    if kind.startswith("cam.domain."):
-        return {"natural_key": ["name"]}
-
-    # Data structure & usage
-    if kind.startswith("cam.data."):
-        return {"natural_key": ["name"]}
-
-    # Mapping
-    if kind.startswith("cam.mapping."):
-        return {"natural_key": ["name"]}
-
-    return {"natural_key": ["name"]}
-
-# ─────────────────────────────────────────────────────────────
-# Dependencies (first-class): per-kind → DependsOnSpec (soft/hard/context_hint)
-# These values are written into schema_versions[].depends_on and also referenced in prompts.
-# ─────────────────────────────────────────────────────────────
-def depends_on_for(kind: str) -> Optional[Dict[str, Any]]:
-    # Diagrams with structured upstream kinds
-    if kind == "cam.diagram.job_flow":
-        return {"hard": ["cam.workflow.job_flow"], "soft": [], "context_hint": "Render jobs/steps and precedence as-is."}
-    if kind == "cam.diagram.call_graph":
-        return {"hard": ["cam.code.call_hierarchy"], "soft": [], "context_hint": "Use nodes/edges from the call hierarchy."}
-    if kind == "cam.diagram.data_flow":
-        return {
-            "soft": [
-                "cam.workflow.job_flow",
-                "cam.code.call_hierarchy",
-                "cam.cobol.file_mapping",
-                "cam.db2.table_usage",
-                "cam.vsam.cluster",
-            ],
-            "context_hint": "Prefer existing job/call/file/DB2/VSAM artifacts to drive data flow edges.",
-        }
-    if kind == "cam.diagram.er":
-        return {"soft": ["cam.data.legacy_structure", "cam.mapping.data_to_entity"], "context_hint": "ER entities should align to legacy structures or mapped entities."}
-    if kind in ("cam.diagram.system_context", "cam.diagram.container_view", "cam.diagram.component_view", "cam.diagram.deployment_view"):
-        return {"soft": ["cam.mapping.legacy_to_modern", "cam.mapping.program_to_service"], "context_hint": "Place legacy and candidate modern services appropriately."}
-
-    # Mappings
-    if kind == "cam.mapping.program_to_service":
-        return {"soft": ["cam.code.interface", "cam.code.call_hierarchy"], "context_hint": "Program boundaries should reflect interfaces and call graph cohesion."}
-    if kind == "cam.mapping.job_to_process":
-        return {"soft": ["cam.workflow.job_flow", "cam.jcl.job", "cam.jcl.step"], "context_hint": "Preserve control flow and step sequencing from JCL/job-flow."}
-    if kind == "cam.mapping.data_to_entity":
-        return {"soft": ["cam.data.legacy_structure"], "context_hint": "Map fields from legacy record layouts to target entities."}
-    if kind == "cam.mapping.legacy_to_modern":
-        return {"soft": ["cam.mapping.program_to_service", "cam.mapping.data_to_entity"], "context_hint": "Aggregate lower-level mappings into system-level viewpoints."}
-
-    # Domain and usage often leverage upstream structured facts but are optional
-    if kind == "cam.domain.business_rules":
-        return {"soft": ["cam.cobol.paragraph_flow", "cam.cobol.program"], "context_hint": "Extract rules from IF/EVALUATE logic and validations."}
-    if kind == "cam.data.usage_matrix":
-        return {"soft": ["cam.cobol.program", "cam.db2.table_usage", "cam.jcl.step"], "context_hint": "Cross programs with elements and operations from parsers/analyzers."}
-
-    # Source and raw analyzers don't require dependencies
-    return None
-
-# ─────────────────────────────────────────────────────────────
-# Prompt config
-# ─────────────────────────────────────────────────────────────
-def prompt_for(kind: str) -> Dict[str, Any]:
-    """
-    Prompts enforce:
-      1) Strict JSON only, conforming to the kind's JSON Schema.
-      2) If the caller passes `context.related` with artifacts for any kinds declared in `depends_on`,
-         you MUST reuse and stay consistent with them; otherwise, infer independently.
-      3) Never invent fields outside the schema. Satisfy ALL required fields.
-      4) Prefer empty arrays/objects over nulls where allowed.
-    The executor/agent should pass:
-      { "schema": <json_schema>, "context": { "related": { <kind>: [<artifacts>], ... } } }
-    """
-    deps = depends_on_for(kind)
-    if deps:
-        kinds = []
-        kinds += list(deps.get("hard", []))
-        kinds += list(deps.get("soft", []))
-        kinds_clause = ", ".join(sorted(set(kinds)))
-        guidance = deps.get("context_hint") or ""
-        deps_txt = (
-            f" Dependencies declared for this kind: [{kinds_clause}]. "
-            f"When `context.related` includes any of these kinds, reuse identifiers, labels, "
-            f"and relationships from those artifacts. {guidance}".strip()
-        )
-    else:
-        deps_txt = " No explicit dependencies for this kind."
-
-    system = (
-        "You are RENOVA. Output strictly valid JSON that conforms EXACTLY to the provided JSON Schema. "
-        "Do NOT include prose or any keys not defined by the schema. "
-        "Populate every required field. "
-        "Prefer concise values and use empty arrays/objects instead of nulls where appropriate."
-        + deps_txt
-    )
-
-    return {
-        "system": system,
-        "user_template": None,
-        "variants": [],
-        "io_hints": {"strict": True},
-        "strict_json": True,
-        "prompt_rev": 3,
-    }
-
-# ─────────────────────────────────────────────────────────────
-# Builder & seeder
-# ─────────────────────────────────────────────────────────────
-def build_kind_doc(kind: str) -> Dict[str, Any]:
-    dep = depends_on_for(kind)
-    return {
-        "_id": kind,
-        "title": artifact_of(kind).replace("_", " ").title(),
-        "summary": f"Canonical artifact for {kind}",
-        "category": category_of(kind),
+            "identity": {"natural_key": ["repo", "commit"]},
+            "examples": [{
+                "repo": "https://git.example.com/legacy/cards.git",
+                "commit": "8f2c1b...",
+                "branch": "main",
+                "paths_root": "/mnt/src/cards"
+            }]
+        }]
+    },
+    {
+        "_id": "cam.asset.source_index",
+        "title": "Source Index",
+        "summary": "Inventory of files in the cloned repo with type detection for COBOL/JCL/etc.",
+        "category": "generic",
+        "aliases": ["cam.asset.repo_index"],
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["root", "files"],
+                "properties": {
+                    "root": {"type": "string"},
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["relpath", "size_bytes", "sha256", "kind"],
+                            "properties": {
+                                "relpath": {"type": "string"},
+                                "size_bytes": {"type": "integer"},
+                                "sha256": {"type": "string"},
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["cobol", "copybook", "jcl", "ddl", "bms", "other"]
+                                },
+                                "language_hint": {"type": "string"},
+                                "encoding": {"type": "string"},
+                                "program_id_guess": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {
+                "system": "Given a raw file walk, emit a strict typed inventory mapping each file to a kind used by downstream parsers. Do not include files outside the root.",
+                "strict_json": True
+            },
+            "depends_on": {
+                "hard": ["cam.asset.repo_snapshot"],
+                "context_hint": "Use `paths_root` from the repo snapshot to anchor relpaths."
+            },
+            "identity": {"natural_key": ["root"]},
+            "examples": [{
+                "root": "/mnt/src/cards",
+                "files": [
+                    {"relpath": "batch/POSTTRAN.cbl", "size_bytes": 12453, "sha256": "...", "kind": "cobol"},
+                    {"relpath": "batch/POSTTRAN.jcl", "size_bytes": 213, "sha256": "...", "kind": "jcl"},
+                    {"relpath": "copy/CUSTREC.cpy", "size_bytes": 982, "sha256": "...", "kind": "copybook"}
+                ]
+            }]
+        }]
+    },
+    {
+        "_id": "cam.cobol.program",
+        "title": "COBOL Program",
+        "summary": "Parsed COBOL program structure (divisions, paragraphs, CALL/PERFORM, IO ops).",
+        "category": "cobol",
         "aliases": [],
         "status": "active",
         "latest_schema_version": LATEST,
-        "schema_versions": [
-            {
-                "version": LATEST,
-                "json_schema": schema_for(kind),
-                "additional_props_policy": "forbid",
-                "prompt": prompt_for(kind),
-                "identity": identity_for(kind),
-                "adapters": [],
-                "migrators": [],
-                "examples": [],
-                # NEW: explicit dependency spec written with the schema version
-                "depends_on": dep if dep else None,
-            }
-        ],
-        "policies": {},
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
-    }
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["program_id", "source", "divisions", "paragraphs"],
+                "properties": {
+                    "program_id": {"type": "string"},
+                    "source": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["relpath", "sha256"],
+                        "properties": {"relpath": {"type": "string"}, "sha256": {"type": "string"}}
+                    },
+                    "divisions": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "identification": {"type": "object", "additionalProperties": True},
+                            "environment": {"type": "object", "additionalProperties": True},
+                            "data": {"type": "object", "additionalProperties": True},
+                            "procedure": {"type": "object", "additionalProperties": True}
+                        }
+                    },
+                    "paragraphs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["name"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "performs": {"type": "array", "items": {"type": "string"}},
+                                "calls": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "required": ["target"],
+                                        "properties": {
+                                            "target": {"type": "string", "description": "PROGRAM-ID if resolvable, else literal"},
+                                            "dynamic": {"type": "boolean", "default": False}
+                                        }
+                                    }
+                                },
+                                "io_ops": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "required": ["op", "dataset_ref"],
+                                        "properties": {
+                                            "op": {"type": "string", "enum": ["READ", "WRITE", "OPEN", "CLOSE", "REWRITE"]},
+                                            "dataset_ref": {"type": "string"},
+                                            "fields": {"type": "array", "items": {"type": "string"}}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "copybooks_used": {"type": "array", "items": {"type": "string"}},
+                    "notes": {"type": "array", "items": {"type": "string"}}
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {
+                "system": "Normalize ProLeap/cb2xml output into this canonical shape. Preserve names; do not invent CALL targets.",
+                "strict_json": True
+            },
+            "depends_on": {
+                "hard": ["cam.asset.source_index"],
+                "soft": ["cam.cobol.copybook"],
+                "context_hint": "Map `source.relpath` to a file in Source Index. Collect copybook names used."
+            },
+            "identity": {"natural_key": ["program_id"]},
+            "examples": [{
+                "program_id": "POSTTRAN",
+                "source": {"relpath": "batch/POSTTRAN.cbl", "sha256": "..."},
+                "divisions": {"identification": {}, "environment": {}, "data": {}, "procedure": {}},
+                "paragraphs": [{"name": "MAIN", "performs": ["VALIDATE-INPUT"], "calls": [], "io_ops": []}]
+            }]
+        }]
+    },
+    {
+        "_id": "cam.cobol.copybook",
+        "title": "COBOL Copybook",
+        "summary": "Structured data items parsed from COPY members.",
+        "category": "cobol",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "source", "items"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "source": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["relpath", "sha256"],
+                        "properties": {"relpath": {"type": "string"}, "sha256": {"type": "string"}}
+                    },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["level", "name", "picture"],
+                            "properties": {
+                                "level": {"type": "string"},
+                                "name": {"type": "string"},
+                                "picture": {"type": "string"},
+                                "occurs": {"type": "integer"},
+                                "children": {"type": "array", "items": {"$ref": "#"}}
+                            }
+                        }
+                    }
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {"system": "Normalize copybook AST into a strict tree. Do not lose levels or PIC clauses.", "strict_json": True},
+            "depends_on": {"hard": ["cam.asset.source_index"]},
+            "identity": {"natural_key": ["name"]},
+            "examples": [{
+                "name": "CUSTREC",
+                "source": {"relpath": "copy/CUSTREC.cpy", "sha256": "..."},
+                "items": [{"level": "01", "name": "CUST-REC", "picture": "", "children": [
+                    {"level": "05", "name": "CUST-ID", "picture": "X(10)"}]}]
+            }]
+        }]
+    },
+    {
+        "_id": "cam.jcl.job",
+        "title": "JCL Job",
+        "summary": "Job metadata and ordered step graph extracted from JCL.",
+        "category": "cobol",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["job_name", "source", "steps"],
+                "properties": {
+                    "job_name": {"type": "string"},
+                    "source": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["relpath", "sha256"],
+                        "properties": {"relpath": {"type": "string"}, "sha256": {"type": "string"}}
+                    },
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["step_name", "seq", "program", "dds"],
+                            "properties": {
+                                "step_name": {"type": "string"},
+                                "seq": {"type": "integer"},
+                                "program": {"type": "string"},
+                                "condition": {"type": "string"},
+                                "dds": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "required": ["ddname", "direction"],
+                                        "properties": {
+                                            "ddname": {"type": "string"},
+                                            "dataset": {"type": "string"},
+                                            "direction": {"type": "string", "enum": ["IN", "OUT", "INOUT"]}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {"system": "Parse JCL into an ordered list of steps with DD statements. Keep program names as written.", "strict_json": True},
+            "depends_on": {"hard": ["cam.asset.source_index"]},
+            "identity": {"natural_key": ["job_name"]},
+            "examples": [{
+                "job_name": "POSTTRAN",
+                "source": {"relpath": "batch/POSTTRAN.jcl", "sha256": "..."},
+                "steps": [{
+                    "step_name": "STEP1", "seq": 1, "program": "POSTTRAN",
+                    "dds": [
+                        {"ddname": "INFILE", "dataset": "TRAN.IN", "direction": "IN"},
+                        {"ddname": "OUTFILE", "dataset": "LEDGER.OUT", "direction": "OUT"}
+                    ]
+                }]
+            }]
+        }]
+    },
+    {
+        "_id": "cam.jcl.step",
+        "title": "JCL Step",
+        "summary": "A single JCL step extracted for cross-referencing with programs and datasets.",
+        "category": "cobol",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["job_name", "step_name", "seq", "program", "dds"],
+                "properties": {
+                    "job_name": {"type": "string"},
+                    "step_name": {"type": "string"},
+                    "seq": {"type": "integer"},
+                    "program": {"type": "string"},
+                    "dds": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["ddname", "direction"],
+                            "properties": {
+                                "ddname": {"type": "string"},
+                                "dataset": {"type": "string"},
+                                "direction": {"type": "string", "enum": ["IN", "OUT", "INOUT"]}
+                            }
+                        }
+                    }
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {"system": "Emit one strict record per JCL step to simplify graph indexing.", "strict_json": True},
+            "depends_on": {"hard": ["cam.jcl.job"]},
+            "identity": {"natural_key": ["job_name", "step_name"]},
+            "examples": [{
+                "job_name": "POSTTRAN",
+                "step_name": "STEP1",
+                "seq": 1,
+                "program": "POSTTRAN",
+                "dds": [{"ddname": "INFILE", "dataset": "TRAN.IN", "direction": "IN"}]
+            }]
+        }]
+    },
+    {
+        "_id": "cam.cics.transaction",
+        "title": "CICS Transaction Map",
+        "summary": "Online transaction → program dispatch mapping.",
+        "category": "cobol",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["region", "transactions"],
+                "properties": {
+                    "region": {"type": "string"},
+                    "transactions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["tranid", "program"],
+                            "properties": {
+                                "tranid": {"type": "string"},
+                                "program": {"type": "string"},
+                                "mapset": {"type": "string"},
+                                "commarea": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {"system": "Normalize CICS catalogs into a simple transaction map.", "strict_json": True},
+            "depends_on": {"soft": ["cam.asset.source_index"]},
+            "identity": {"natural_key": ["region"]},
+            "examples": [{
+                "region": "CICSPROD",
+                "transactions": [{"tranid": "PAY1", "program": "PAYMENT"}, {"tranid": "BAL1", "program": "BALENQ"}]
+            }]
+        }]
+    },
+    {
+        "_id": "cam.data.model",
+        "title": "Data Model",
+        "summary": "Logical and physical data structures (entities, tables, datasets).",
+        "category": "data",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["logical", "physical"],
+                "properties": {
+                    "logical": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["name", "fields"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "fields": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "required": ["name", "type"],
+                                        "properties": {
+                                            "name": {"type": "string"},
+                                            "type": {"type": "string"},
+                                            "source_refs": {"type": "array", "items": {"type": "string"}}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "physical": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["name", "type"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "type": {"type": "string", "enum": ["DB2_TABLE", "VSAM", "SEQ", "FILE"]},
+                                "columns": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "required": ["name", "pic_or_sqltype"],
+                                        "properties": {"name": {"type": "string"}, "pic_or_sqltype": {"type": "string"}}
+                                    }
+                                },
+                                "source_refs": {"type": "array", "items": {"type": "string"}}
+                            }
+                        }
+                    }
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {
+                "system": "Map copybook fields and DB2/DDL into a normalized logical/physical model. Do not invent entities; aggregate identical record layouts.",
+                "strict_json": True,
+                "variants": [
+                    {"name": "cobol-first", "when": {"stack": "cobol"}, "system": "Prefer copybooks as truth; fold DB2 later."}
+                ]
+            },
+            "depends_on": {
+                "hard": ["cam.cobol.copybook"],
+                "soft": ["cam.jcl.job", "cam.jcl.step"],
+                "context_hint": "Use copybook trees to propose logical entities; attach physical refs from JCL DD datasets or DB2 DDL if present."
+            },
+            "identity": {"natural_key": ["logical[*].name"]},
+            "examples": [{
+                "logical": [{"name": "Transaction", "fields": [{"name": "AMOUNT", "type": "NUMERIC(9,2)"}]}],
+                "physical": [{
+                    "name": "TRAN.IN", "type": "SEQ",
+                    "columns": [{"name": "AMOUNT", "pic_or_sqltype": "S9(7)V99"}]
+                }]
+            }]
+        }]
+    },
+    {
+        "_id": "cam.data.dictionary",
+        "title": "Domain Data Dictionary",
+        "summary": "Business terms and definitions mined from copybooks/columns.",
+        "category": "domain",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["terms"],
+                "properties": {
+                    "terms": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["term", "definition"],
+                            "properties": {
+                                "term": {"type": "string"},
+                                "definition": {"type": "string"},
+                                "aliases": {"type": "array", "items": {"type": "string"}},
+                                "source_refs": {"type": "array", "items": {"type": "string"}}
+                            }
+                        }
+                    }
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {
+                "system": "Extract a business-friendly data dictionary from copybook/table names with concise definitions. No prose outside JSON.",
+                "strict_json": True
+            },
+            "depends_on": {"hard": ["cam.cobol.copybook"], "soft": ["cam.data.model"]},
+            "identity": {"natural_key": ["terms[*].term"]},
+            "examples": [{
+                "terms": [{"term": "Account Balance", "definition": "Current monetary balance on an account.", "aliases": ["BAL", "ACCT-BAL"]}]
+            }]
+        }]
+    },
+    {
+        "_id": "cam.data.lineage",
+        "title": "Data Lineage",
+        "summary": "Field-level read/write lineage across programs, steps, and datasets.",
+        "category": "data",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["edges"],
+                "properties": {
+                    "edges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["from", "to", "op"],
+                            "properties": {
+                                "from": {"type": "string", "description": "qualified source e.g., PROGRAM.PARAGRAPH.FIELD or DATASET.FIELD"},
+                                "to": {"type": "string", "description": "qualified target"},
+                                "op": {"type": "string", "enum": ["READ", "WRITE", "TRANSFORM"]},
+                                "evidence": {"type": "array", "items": {"type": "string"}}
+                            }
+                        }
+                    }
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {"system": "Emit lineage edges only where there is evidence (IO ops, assignments). Be conservative.", "strict_json": True},
+            "depends_on": {"hard": ["cam.cobol.program", "cam.jcl.step"], "soft": ["cam.data.model"]},
+            "identity": {"natural_key": ["from", "to", "op"]},
+            "examples": [{
+                "edges": [
+                    {"from": "TRAN.IN.AMOUNT", "to": "POSTTRAN.MAIN.AMOUNT", "op": "READ"},
+                    {"from": "POSTTRAN.MAIN.BALANCE", "to": "LEDGER.OUT.BALANCE", "op": "WRITE"}
+                ]
+            }]
+        }]
+    },
+    {
+        "_id": "cam.asset.service_inventory",
+        "title": "Service/Asset Inventory",
+        "summary": "Catalog of programs, jobs, transactions, datasets discovered in the run.",
+        "category": "generic",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["programs", "jobs", "datasets", "transactions"],
+                "properties": {
+                    "programs": {"type": "array", "items": {"type": "string"}},
+                    "jobs": {"type": "array", "items": {"type": "string"}},
+                    "datasets": {"type": "array", "items": {"type": "string"}},
+                    "transactions": {"type": "array", "items": {"type": "string"}}
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {"system": "Aggregate identifiers from upstream facts into a single inventory. Do not rename.", "strict_json": True},
+            "depends_on": {"hard": ["cam.cobol.program", "cam.jcl.job"], "soft": ["cam.cics.transaction"]},
+            "identity": {"natural_key": ["programs", "jobs", "datasets", "transactions"]},
+            "examples": [{
+                "programs": ["POSTTRAN"],
+                "jobs": ["POSTTRAN"],
+                "datasets": ["TRAN.IN", "LEDGER.OUT"],
+                "transactions": []
+            }]
+        }]
+    },
+    {
+        "_id": "cam.asset.dependency_inventory",
+        "title": "Dependency Inventory",
+        "summary": "Call graph, job flow, and dataset dependencies as adjacency lists.",
+        "category": "generic",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["call_graph", "job_flow", "dataset_deps"],
+                "properties": {
+                    "call_graph": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["from", "to"],
+                            "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "dynamic": {"type": "boolean"}}
+                        }
+                    },
+                    "job_flow": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["job", "step", "seq", "program"],
+                            "properties": {
+                                "job": {"type": "string"},
+                                "step": {"type": "string"},
+                                "seq": {"type": "integer"},
+                                "program": {"type": "string"}
+                            }
+                        }
+                    },
+                    "dataset_deps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["producer", "dataset", "consumer"],
+                            "properties": {
+                                "producer": {"type": "string"},
+                                "dataset": {"type": "string"},
+                                "consumer": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {"system": "Build deterministic edges from parsed facts. Do not infer missing endpoints.", "strict_json": True},
+            "depends_on": {"hard": ["cam.cobol.program", "cam.jcl.step"]},
+            "identity": {"natural_key": ["call_graph", "job_flow", "dataset_deps"]},
+            "examples": [{
+                "call_graph": [],
+                "job_flow": [{"job": "POSTTRAN", "step": "STEP1", "seq": 1, "program": "POSTTRAN"}],
+                "dataset_deps": [{"producer": "STEP1", "dataset": "LEDGER.OUT", "consumer": "DOWNSTREAM"}]
+            }]
+        }]
+    },
+    {
+        "_id": "cam.workflow.process",
+        "title": "Workflow Process",
+        "summary": "BPMN/UML-Activity-like process describing batch or entity-centric flows.",
+        "category": "workflow",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "type", "nodes", "edges"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "type": {"type": "string", "enum": ["batch", "entity"]},
+                    "lanes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["id", "label"],
+                            "properties": {"id": {"type": "string"}, "label": {"type": "string"}}
+                        }
+                    },
+                    "nodes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["id", "kind", "label"],
+                            "properties": {
+                                "id": {"type": "string"},
+                                "kind": {"type": "string", "enum": ["start", "end", "task", "gateway", "event"]},
+                                "label": {"type": "string"},
+                                "lane": {"type": "string"},
+                                "refs": {"type": "array", "items": {"type": "string"}}
+                            }
+                        }
+                    },
+                    "edges": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["from", "to"],
+                            "properties": {
+                                "from": {"type": "string"},
+                                "to": {"type": "string"},
+                                "condition": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {
+                "system": "Given inventories and dependency graphs, emit a minimal process graph. Prefer deterministic stitching for batch; use naming heuristics only for labels.",
+                "strict_json": True,
+                "variants": [
+                    {"name": "entity-centric", "when": {"mode": "entity"}, "system": "Slice graphs around fields/entities in cam.data.model and produce a business-readable flow."}
+                ]
+            },
+            "depends_on": {"hard": ["cam.asset.dependency_inventory"], "soft": ["cam.data.model", "cam.data.lineage"]},
+            "identity": {"natural_key": ["name", "type"]},
+            "examples": [{
+                "name": "POSTTRAN Batch",
+                "type": "batch",
+                "lanes": [{"id": "job", "label": "JCL Job"}],
+                "nodes": [
+                    {"id": "n0", "kind": "start", "label": "Start"},
+                    {"id": "n1", "kind": "task", "label": "POSTTRAN"},
+                    {"id": "n2", "kind": "end", "label": "End"}
+                ],
+                "edges": [{"from": "n0", "to": "n1"}, {"from": "n1", "to": "n2"}]
+            }]
+        }]
+    },
+    {
+        "_id": "cam.diagram.activity",
+        "title": "Activity Diagram",
+        "summary": "Activity/flow rendering of a workflow process.",
+        "category": "diagram",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["source_process", "diagram"],
+                "properties": {
+                    "source_process": {"type": "string"},
+                    "diagram": {"type": "object", "additionalProperties": True}
+                }
+            },
+            "additional_props_policy": "allow",
+            "prompt": {"system": "Render the referenced workflow process as an activity diagram JSON. Preserve node and edge ids.", "strict_json": True},
+            "depends_on": {"hard": ["cam.workflow.process"]},
+            "identity": {"natural_key": ["source_process"]},
+            "adapters": [{"type": "dsl", "dsl": {"to_plantuml": "activity_dsl_to_puml"}}],
+            "examples": [{"source_process": "POSTTRAN Batch", "diagram": {"nodes": [], "edges": []}}]
+        }]
+    },
+    {
+        "_id": "cam.domain.dictionary",
+        "title": "Domain Dictionary",
+        "summary": "Normalized business vocabulary used across artifacts.",
+        "category": "domain",
+        "status": "active",
+        "latest_schema_version": LATEST,
+        "schema_versions": [{
+            "version": LATEST,
+            "json_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["entries"],
+                "properties": {
+                    "entries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["term", "kind"],
+                            "properties": {
+                                "term": {"type": "string"},
+                                "kind": {"type": "string", "enum": ["entity", "event", "metric", "policy", "other"]},
+                                "definition": {"type": "string"},
+                                "aliases": {"type": "array", "items": {"type": "string"}},
+                                "mappings": {"type": "array", "items": {"type": "string"}}
+                            }
+                        }
+                    }
+                }
+            },
+            "additional_props_policy": "forbid",
+            "prompt": {"system": "Produce consistent, de-duplicated business terms grounded in upstream copybooks and data model. Keep definitions concise and non-ambiguous.", "strict_json": True},
+            "depends_on": {"hard": ["cam.data.model", "cam.data.dictionary"]},
+            "identity": {"natural_key": ["entries[*].term"]},
+            "examples": [{
+                "entries": [{
+                    "term": "Transaction",
+                    "kind": "entity",
+                    "definition": "A financial posting.",
+                    "aliases": ["TXN"],
+                    "mappings": ["copybook:CUST-REC", "table:TRAN.IN"]
+                }]
+            }]
+        }]
+    },
+]
 
+# ─────────────────────────────────────────────────────────────
+# Seeder
+# ─────────────────────────────────────────────────────────────
 def seed_registry() -> None:
-    for k in ALL_KINDS:
-        upsert_kind(build_kind_doc(k))
+    now = datetime.utcnow()
+    for doc in KIND_DOCS:
+        # Ensure common top-level fields exist
+        doc.setdefault("aliases", [])
+        doc.setdefault("policies", {})
+        doc["created_at"] = doc.get("created_at", now)
+        doc["updated_at"] = now
+        upsert_kind(doc)
 
 if __name__ == "__main__":
     seed_registry()
-    print(f"Seeded {len(ALL_KINDS)} kinds into registry.")
+    print(f"Seeded {len(KIND_DOCS)} kinds into registry.")
