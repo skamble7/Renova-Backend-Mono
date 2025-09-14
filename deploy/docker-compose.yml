@@ -21,139 +21,23 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  renova-capability-registry:
+  renova-capability-service:
     build:
       context: ..
-      dockerfile: services/capability-registry/Dockerfile
-    container_name: renova-capability-registry
+      dockerfile: services/capability-service/Dockerfile
+    container_name: renova-capability-service
     restart: unless-stopped
     env_file:
-      - ../services/capability-registry/.env.example
+      - ../services/capability-service/.env.example
     environment:
       MONGO_URI: ${MONGO_URI:-mongodb+srv://sandeepk:sandeep@cluster0.tnbpi.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0}
       MONGO_DB: ${MONGO_DB:-renova}
       RABBITMQ_URI: ${RABBITMQ_URI:-amqp://raina:raina@host.docker.internal:5672/}
       RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-raina.events}
       EVENTS_ORG: ${EVENTS_ORG:-renova}
-      ARTIFACT_SERVICE_URL: ${ARTIFACT_SERVICE_URL:-http://renova-artifact-service:9011}
-      SERVICE_NAME: renovacapability-registry
-      PORT: ${CAPABILITY_SERVICE_PORT:-9012}
+      PLATFORM_EVENTS_ORG: ${PLATFORM_EVENTS_ORG:-platform}
+      SERVICE_NAME: capability-service
     ports:
       - "9012:9012"
-    depends_on:
-      renova-artifact-service:
-        condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
-  
-  renova-learning-service:
-    build:
-      context: ..
-      dockerfile: services/learning-service/Dockerfile
-    container_name: renova-learning-service
-    restart: unless-stopped
-    env_file:
-      - ../services/learning-service/.env.example
-    environment:
-      # Mongo
-      MONGO_URI: ${MONGO_URI:-mongodb+srv://sandeepk:sandeep@cluster0.tnbpi.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0}
-      MONGO_DB: ${MONGO_DB:-renova}
-      # RabbitMQ
-      RABBITMQ_URI: ${RABBITMQ_URI:-amqp://raina:raina@host.docker.internal:5672/}
-      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-raina.events}
-      EVENTS_ORG: ${EVENTS_ORG:-renova}
-      # Downstream services
-      ARTIFACT_SERVICE_URL: ${ARTIFACT_SERVICE_URL:-http://renova-artifact-service:9011}
-      CAPABILITY_REGISTRY_URL: ${CAPABILITY_REGISTRY_URL:-http://renova-capability-registry:9012}
-      # Tool connectors
-      GITHUB_FETCHER_BASE_URL: ${GITHUB_FETCHER_BASE_URL:-http://renova-github-fetcher:8080}
-      PROLEAP_PARSER_BASE_URL: ${PROLEAP_PARSER_BASE_URL:-http://renova-proleap-cb2xml:8080}
-      PARSER_JCL_BASE_URL: ${PARSER_JCL_BASE_URL:-http://parser-jcl-host:8080}
-      ANALYZER_DB2_BASE_URL: ${ANALYZER_DB2_BASE_URL:-http://db2-analyzer-host:8080}
-      LANDING_ZONE: /landing_zone
-      # LLM
-      MODEL_ID: ${MODEL_ID:-openai:gpt-4o-mini}
-      OPENAI_API_KEY: <Key>
-      # Service metadata
-      SERVICE_NAME: learning-service
-      PORT: ${LEARNING_SERVICE_PORT:-9013}
-      ENV: ${ENV:-local}
-      REQUEST_TIMEOUT_S: ${REQUEST_TIMEOUT_S:-60}
-    ports:
-      - "9013:9013"
-    volumes:
-      - renova_landing_shared:/landing_zone
-    depends_on:
-      renova-artifact-service:
-        condition: service_started
-      renova-capability-registry:
-        condition: service_started
-      renova-proleap-cb2xml:
-        condition: service_healthy
-      renova-github-fetcher:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9013/health >/dev/null || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-  renova-proleap-cb2xml:
-    build:
-      context: ../services/tools/parsers/languages/cobol/proleap-cb2xml
-      dockerfile: Dockerfile
-    container_name: renova-proleap-cb2xml
-    image: renova/proleap-cb2xml:latest
-    restart: unless-stopped
-    environment:
-      PORT: "8080"
-      LANDING_ZONE: "/landing_zone"
-      PROLEAP_JAR: "/opt/jars/proleap-cli.jar"
-      CB2XML_JAR:  "/opt/jars/cb2xml.jar"
-    ports:
-      - "8080:8080"
-    volumes:
-      - renova_landing_shared:/landing_zone
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "test -f /opt/jars/proleap-cli.jar -a -f /opt/jars/cb2xml.jar && curl -fsS http://localhost:8080/health >/dev/null || exit 1"
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-  renova-github-fetcher:
-    build:
-      context: ../services/tools/fetchers/scm/github/github-fetcher
-      dockerfile: Dockerfile
-    container_name: renova-github-fetcher
-    image: renova/github-fetcher:latest
-    restart: unless-stopped
-    environment:
-      PORT: "8080"
-      LANDING_ZONE: "/landing_zone"
-      # GITHUB_TOKEN: ${GITHUB_TOKEN}   # uncomment for private repos
-    ports:
-      - "8081:8080"
-    volumes:
-      - renova_landing_shared:/landing_zone
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "curl -fsS http://localhost:8080/health >/dev/null || curl -fsS http://localhost:8080/docs >/dev/null || exit 1"
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-volumes:
-  renova_landing_shared:
