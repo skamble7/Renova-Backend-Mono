@@ -41,6 +41,8 @@ async def init_indexes() -> None:
     # integrations
     await db.integrations.create_index("id", unique=True)
     await db.integrations.create_index("name")
+    await db.integrations.create_index("transport.kind")  # <- new
+    await db.integrations.create_index("tags")
 
     # capability_packs
     await db.capability_packs.create_index([("key", 1), ("version", 1)], unique=True)

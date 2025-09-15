@@ -68,12 +68,12 @@ add_cors(app)
 install_request_logging(app)
 add_error_handlers(app)
 
-# Routers
+# Routers (order matters: static before dynamic to avoid shadowing)
 app.include_router(health_router)
-app.include_router(capability_router)
-app.include_router(integration_router)
 app.include_router(pack_router)
 app.include_router(resolved_router)
+app.include_router(integration_router)
+app.include_router(capability_router)
 
 
 @app.get("/")

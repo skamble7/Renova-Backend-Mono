@@ -17,6 +17,19 @@ def _strip_none(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
+def _deep_merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Shallow + recursive dict merge for nested structures (e.g., transport.*).
+    """
+    out = dict(base)
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 class IntegrationDAL:
     """
     CRUD for MCPIntegration (reusable integrations registry).
@@ -43,32 +56,49 @@ class IntegrationDAL:
         return res.deleted_count == 1
 
     async def update(self, integration_id: str, patch: Dict[str, Any]) -> Optional[MCPIntegration]:
-        update_dict = _strip_none(patch)
-        update_doc = {"$set": {**update_dict, "updated_at": _utcnow()}}
-        doc = await self.col.find_one_and_update(
-            {"id": integration_id},
-            update_doc,
-            return_document=ReturnDocument.AFTER,
-        )
-        return MCPIntegration.model_validate(doc) if doc else None
+        """
+        Two-phase update:
+          1) Read existing doc, deep-merge patch.
+          2) Validate merged document against MCPIntegration.
+          3) Persist (replace) atomically.
+        Prevents storing invalid union shapes.
+        """
+        existing = await self.col.find_one({"id": integration_id})
+        if not existing:
+            return None
+
+        merged = _deep_merge(existing, _strip_none(patch))
+        merged["updated_at"] = _utcnow()
+
+        # Validate full shape with discriminated union
+        valid = MCPIntegration.model_validate(merged).model_dump()
+
+        # Replace the doc to avoid partial invalid states
+        await self.col.replace_one({"id": integration_id}, valid, upsert=False)
+        return MCPIntegration.model_validate(valid)
 
     async def search(
         self,
         *,
         q: Optional[str] = None,
         tag: Optional[str] = None,
+        kind: Optional[str] = None,  # "http" | "stdio"
         limit: int = 50,
         offset: int = 0,
     ) -> Tuple[List[MCPIntegration], int]:
         filt: Dict[str, Any] = {"type": "mcp"}
         if tag:
             filt["tags"] = tag
+        if kind in ("http", "stdio"):
+            filt["transport.kind"] = kind
         if q:
+            # Match id/name/description + union-specific fields
             filt["$or"] = [
                 {"id": {"$regex": q, "$options": "i"}},
                 {"name": {"$regex": q, "$options": "i"}},
                 {"description": {"$regex": q, "$options": "i"}},
-                {"endpoint": {"$regex": q, "$options": "i"}},
+                {"transport.base_url": {"$regex": q, "$options": "i"}},  # http
+                {"transport.command": {"$regex": q, "$options": "i"}},   # stdio
             ]
 
         total = await self.col.count_documents(filt)

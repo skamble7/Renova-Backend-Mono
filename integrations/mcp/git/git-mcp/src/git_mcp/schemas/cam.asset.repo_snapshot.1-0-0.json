@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["repo", "commit", "branch", "paths_root"],
+  "properties": {
+    "repo": { "type": "string" },
+    "commit": { "type": "string" },
+    "branch": { "type": "string" },
+    "paths_root": { "type": "string" },
+    "tags": { "type": "array", "items": { "type": "string" } }
+  }
+}

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -42,10 +42,11 @@ async def delete_integration(integration_id: str, actor: Optional[str] = None):
 
 @router.get("", response_model=List[MCPIntegration])
 async def list_integrations(
-    q: Optional[str] = Query(default=None),
+    q: Optional[str] = Query(default=None, description="Free text over id/name/description and transport fields"),
     tag: Optional[str] = Query(default=None),
+    kind: Optional[Literal["http", "stdio"]] = Query(default=None, description="Transport kind filter"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ):
-    items, _ = await svc.search(q=q, tag=tag, limit=limit, offset=offset)
+    items, _ = await svc.search(q=q, tag=tag, kind=kind, limit=limit, offset=offset)
     return items

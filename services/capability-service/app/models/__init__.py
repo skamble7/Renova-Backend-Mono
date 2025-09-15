@@ -1,4 +1,4 @@
-from .integration_models import IntegrationAuthRef, MCPIntegration, IntegrationSnapshot
+from .integration_models import IntegrationAuthRef, MCPIntegration, IntegrationSnapshot, Transport, StdioTransport, HTTPTransport
 from .capability_models import (
     LLMConfig,
     GlobalCapability,

@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "required": ["artifacts"],
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "version", "body"],
+        "properties": {
+          "kind": { "type": "string", "const": "cam.asset.repo_snapshot" },
+          "version": { "type": "string", "pattern": "^1\\.0\\.0$" },
+          "body": {
+            "type": "object",
+            "required": ["repo", "commit", "branch", "paths_root"],
+            "properties": {
+              "repo": { "type": "string" },
+              "commit": { "type": "string" },
+              "branch": { "type": "string" },
+              "paths_root": { "type": "string" },
+              "tags": { "type": "array", "items": { "type": "string" } }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

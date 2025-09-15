@@ -1,0 +1,23 @@
+# --- Renova local artifacts (safe to ignore completely) ---
+.renova/
+.mcp/
+
+# --- MCP servers / Python ---
+**/__pycache__/
+**/*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# --- Env & local config ---
+*.env
+**/.env
+.vscode/mcp.json
+
+# --- Logs & temp ---
+*.log
+*.tmp
+*.swp
+
+# --- macOS ---
+.DS_Store
