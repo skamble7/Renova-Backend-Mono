@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "cam.cobol.program@1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["program_id", "source", "divisions", "paragraphs"],
+  "properties": {
+    "program_id": { "type": "string" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relpath", "sha256"],
+      "properties": {
+        "relpath": { "type": "string" },
+        "sha256": { "type": "string" }
+      }
+    },
+    "divisions": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "identification": { "type": "object" },
+        "environment": { "type": "object" },
+        "data": { "type": "object" },
+        "procedure": { "type": "object" }
+      }
+    },
+    "paragraphs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "performs": { "type": "array", "items": { "type": "string" } },
+          "calls": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["target"],
+              "properties": {
+                "target": { "type": "string" },
+                "dynamic": { "type": "boolean" }
+              }
+            }
+          },
+          "io_ops": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["op", "dataset_ref"],
+              "properties": {
+                "op": { "type": "string", "enum": ["READ","WRITE","OPEN","CLOSE","REWRITE"] },
+                "dataset_ref": { "type": "string" },
+                "fields": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "copybooks_used": { "type": "array", "items": { "type": "string" } },
+    "notes": { "type": "array", "items": { "type": "string" } }
+  }
+}

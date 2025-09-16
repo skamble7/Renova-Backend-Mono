@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "cam.cobol.copybook@1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "source", "items"],
+  "properties": {
+    "name": { "type": "string" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relpath", "sha256"],
+      "properties": {
+        "relpath": { "type": "string" },
+        "sha256": { "type": "string" }
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/item" }
+    }
+  },
+  "$defs": {
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "name", "picture"],
+      "properties": {
+        "level": { "type": "string" },
+        "name": { "type": "string" },
+        "picture": { "type": "string" },
+        "occurs": { "type": "integer" },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/item" }
+        }
+      }
+    }
+  }
+}
