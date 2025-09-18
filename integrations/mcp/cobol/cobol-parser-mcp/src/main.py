@@ -13,8 +13,11 @@ from src.utils.discovery import walk_sources, filter_paths
 from src.utils.encoding import detect_encoding
 from src.utils.hashing import sha256_bytes
 from src.utils.validator import SchemaRegistry
+from src.utils.indexer import build_source_index  # NEW
 from src.parser.proleap_adapter import ProLeapAdapter
 from src.parser.normalizer import normalize_copybook, normalize_program
+from src.utils.indexer import build_source_index, derive_copy_paths
+
 
 _shutdown = False
 
@@ -76,7 +79,7 @@ def list_tools() -> Dict[str, Any]:
         "tools": [
             {
                 "name": "parse_tree",
-                "description": "Parse COBOL programs and copybooks; normalize to CAM kinds.",
+                "description": "Parse COBOL programs and copybooks; normalize to CAM kinds. Also emits cam.asset.source_index.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["root"],
@@ -86,7 +89,7 @@ def list_tools() -> Dict[str, Any]:
                         "dialect": {
                             "type": "string",
                             "enum": ["COBOL85", "ENTERPRISE", "IBM"],
-                            "default": "COBOL85",
+                            "default": "COBOL85"
                         },
                         "use_source_index": {"type": "boolean", "default": True},
                         "debug_raw": {
@@ -97,15 +100,15 @@ def list_tools() -> Dict[str, Any]:
                         "raw_dump_dir": {
                             "type": "string",
                             "description": "Directory root for raw AST dumps. Defaults to /tmp/proleap_raw (or RAW_AST_DUMP_DIR env)."
-                        },
+                        }
                     },
                     "additionalProperties": False
-                },
+                }
             }
         ]
     }
 
-
+# ------------------------------ Core -----------------------------------
 def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
     root = inp.get("root")
     if not root or not isinstance(root, str):
@@ -114,6 +117,7 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
     root = _normalize_root(root)
     dialect = inp.get("dialect", "COBOL85")
     allow_paths = inp.get("paths") or []
+    use_source_index: bool = bool(inp.get("use_source_index", True))
     debug_raw: bool = bool(inp.get("debug_raw", False))
     raw_dump_dir: str = inp.get("raw_dump_dir") or os.environ.get("RAW_AST_DUMP_DIR") or "/tmp/proleap_raw"
 
@@ -124,7 +128,7 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
         "programs_emitted": 0,
         "copybooks_emitted": 0,
         "parser_version": "normalizer=1.0.0,adapter=proleap/0.0.2",
-        "raw_dump_dir": raw_dump_dir if debug_raw else "",
+        "raw_dump_dir": raw_dump_dir if debug_raw else ""
     }
 
     if not os.path.isdir(root):
@@ -135,10 +139,34 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
     registry = SchemaRegistry(schema_dir)
     adapter = ProLeapAdapter()
 
-    items = walk_sources(root)
-    items = list(filter_paths(items, allow_paths))
+    # --- A) Build and emit Source Index (always build; emit as artifact) ---
+    index_data = build_source_index(root)
 
-    for abs_p, rel_p, kind in items:
+    copy_dirs_rel = derive_copy_paths(index_data)
+    copy_dirs_abs = [os.path.join(root, d) for d in copy_dirs_rel]
+
+    idx_artifact = {"kind": "cam.asset.source_index", "version": "1.0.0", "data": index_data}
+    idx_errors = registry.validate(idx_artifact)
+    if idx_errors:
+        diagnostics.append({"level": "warning", "relpath": "", "message": f"Index schema: {idx_errors[:3]}{'...' if len(idx_errors)>3 else ''}"})
+    else:
+        artifacts.append(idx_artifact)
+
+    # --- B) Choose parse targets ---
+    if use_source_index:
+        # Respect allow_paths if supplied
+        files = index_data.get("files", [])
+        if allow_paths:
+            allow_set = {p.strip().lstrip("./") for p in allow_paths if p.strip()}
+            files = [f for f in files if f.get("relpath") in allow_set]
+        targets = [(os.path.join(root, f["relpath"]), f["relpath"], f["kind"])
+                   for f in files if f.get("kind") in {"cobol", "copybook"}]
+    else:
+        # Legacy discovery based on extensions
+        targets = list(filter_paths(walk_sources(root), allow_paths))
+
+    # --- C) Parse files ---
+    for abs_p, rel_p, kind in targets:
         stats["files_scanned"] += 1
         try:
             with open(abs_p, "rb") as f:
@@ -163,9 +191,9 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
                 dialect=dialect,
                 dump_raw=debug_raw,
                 dump_dir=raw_dump_dir,
+                copy_paths=copy_dirs_abs
             )
             data = normalize_program(ast, relpath=rel_p, sha256=content_hash)
-            # surface raw dump path in notes (non-fatal, best-effort)
             dump_note = ast.get("_raw_dump_path")
             if dump_note:
                 (data.setdefault("notes", [])).append({"kind": "raw-ast", "tool": "proleap/cb2xml", "path": dump_note})
@@ -173,8 +201,11 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
             artifact = {"kind": "cam.cobol.program", "version": "1.0.0", "data": data}
             errors = registry.validate(artifact)
             if errors:
-                diagnostics.append({"level": "warning", "relpath": rel_p,
-                                    "message": f"Schema: {errors[:3]}{'...' if len(errors)>3 else ''}"})
+                diagnostics.append({
+                    "level": "warning",
+                    "relpath": rel_p,
+                    "message": f"Schema: {errors[:3]}{'...' if len(errors)>3 else ''}"
+                })
             else:
                 stats["programs_emitted"] += 1
                 artifacts.append(artifact)
@@ -185,7 +216,7 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
                 relpath=rel_p,
                 dialect=dialect,
                 dump_raw=debug_raw,
-                dump_dir=raw_dump_dir,
+                dump_dir=raw_dump_dir
             )
             data = normalize_copybook(ast, relpath=rel_p, sha256=content_hash)
             dump_note = ast.get("_raw_dump_path")
@@ -195,8 +226,11 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
             artifact = {"kind": "cam.cobol.copybook", "version": "1.0.0", "data": data}
             errors = registry.validate(artifact)
             if errors:
-                diagnostics.append({"level": "warning", "relpath": rel_p,
-                                    "message": f"Schema: {errors[:3]}{'...' if len(errors)>3 else ''}"})
+                diagnostics.append({
+                    "level": "warning",
+                    "relpath": rel_p,
+                    "message": f"Schema: {errors[:3]}{'...' if len(errors)>3 else ''}"
+                })
             else:
                 stats["copybooks_emitted"] += 1
                 artifacts.append(artifact)
@@ -216,14 +250,13 @@ def _send(obj: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 def _send_error(id_val: Any, code: int, message: str, data: Dict[str, Any] | None = None) -> None:
-    _send({"jsonrpc": "2.0", "id": id_val,
-           "error": {"code": code, "message": message, "data": data or {}}})
+    _send({"jsonrpc": "2.0", "id": id_val, "error": {"code": code, "message": message, "data": data or {}}})
 
 def _handle_initialize(msg: Dict[str, Any]) -> None:
     result = {
         "protocolVersion": "0.1",
         "serverInfo": {"name": "mcp.cobol.parser", "version": "0.0.1"},
-        "capabilities": {"tools": {}},
+        "capabilities": {"tools": {}}
     }
     _send({"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
 

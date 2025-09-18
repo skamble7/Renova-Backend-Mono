@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "cam.asset.source_index@1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["root", "files"],
+  "properties": {
+    "root": { "type": "string" },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["relpath", "size_bytes", "sha256", "kind"],
+        "properties": {
+          "relpath": { "type": "string" },
+          "size_bytes": { "type": "integer" },
+          "sha256": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": ["cobol", "copybook", "jcl", "ddl", "bms", "other"]
+          },
+          "language_hint": { "type": "string" },
+          "encoding": { "type": "string" },
+          "program_id_guess": { "type": "string" },
+          "copybook_dir_hint": { "type": "boolean" },
+          "format_hint": { "type": "string", "enum": ["FIXED", "FREE", "VARIABLE"] }
+        }
+      }
+    }
+  }
+}

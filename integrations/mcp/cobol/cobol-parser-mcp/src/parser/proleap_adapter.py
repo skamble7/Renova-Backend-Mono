@@ -8,6 +8,8 @@ import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from functools import lru_cache
+
 
 
 # --- simple regex fallbacks ---
@@ -17,6 +19,48 @@ _PERFORM_RE    = re.compile(r"\bPERFORM\s+([A-Za-z0-9][A-Za-z0-9-]*)\b", re.IGNO
 _CALL_RE       = re.compile(r"\bCALL\s+(?:\"|'|)([A-Za-z0-9][A-Za-z0-9-]*)(?:\"|'|)\b", re.IGNORECASE)
 _COPY_RE       = re.compile(r"\bCOPY\s+([A-Za-z0-9][A-Za-z0-9-]*)\b", re.IGNORECASE)
 _IO_RE         = re.compile(r"\b(OPEN|CLOSE|READ|WRITE|REWRITE|DELETE|START)\b", re.IGNORECASE)
+
+@lru_cache(maxsize=1024)
+def _read_copy_candidate(abs_path: str) -> Optional[str]:
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception:
+        return None
+
+def _expand_copys(text: str, relpath: str, copy_dirs: List[str]) -> str:
+    """
+    Very small include preprocessor for `COPY NAME.` lines.
+    Supports: bare `COPY NAME.` on its own line.
+    Does NOT implement REPLACING (we can add common patterns later).
+    """
+    if not copy_dirs:
+        return text
+
+    lines = text.splitlines(keepends=True)
+    out: List[str] = []
+    for ln in lines:
+        m = _COPY_RE.search(ln)
+        if m and ln.strip().upper().endswith("."):
+            name = m.group(1)
+            # try NAME.cpy / NAME.CPY / NAME.copy
+            candidates = []
+            for d in copy_dirs:
+                for ext in (".cpy", ".CPY", ".copy", ".COPY"):
+                    candidates.append(os.path.join(d, f"{name}{ext}"))
+            included = None
+            for c in candidates:
+                s = _read_copy_candidate(c)
+                if s is not None:
+                    included = s
+                    break
+            if included is not None:
+                # naive include; retain a marker comment
+                out.append(f"      *COPY {name}*.\n")
+                out.append(included if included.endswith("\n") else included + "\n")
+                continue
+        out.append(ln)
+    return "".join(out)
 
 # --- neutralize unsupported EXEC blocks for ProLeap (IMS, DLI, etc.) ---
 # Replace EXEC DLI/IMS ... END-EXEC. (single statement or multiline) with a no-op.
@@ -86,8 +130,15 @@ class ProLeapAdapter:
         dialect: str,
         dump_raw: bool = False,
         dump_dir: Optional[str] = None,  # kept for API compatibility (unused; we prefer env)
+        copy_paths: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         want_dump = _should_dump(dump_raw)
+
+        if copy_paths:
+            try:
+                text = _expand_copys(text, relpath, copy_paths)
+            except Exception:
+                pass
 
         xml_str, attempts, raw_out = self._run_proleap(text, dialect, relpath)
         if want_dump:
