@@ -1,0 +1,69 @@
+    <project xmlns="http://maven.apache.org/POM/4.0.0"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.renova.proleap</groupId>
+    <artifactId>proleap-cli-bridge</artifactId>
+    <version>1.0.0</version>
+    <name>proleap-cli-bridge</name>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <!-- Your locally installed ProLeap parser -->
+        <dependency>
+            <groupId>io.github.uwol</groupId>
+            <artifactId>proleap-cobol-parser</artifactId>
+            <version>4.0.0</version>
+        </dependency>
+
+        <!-- Help the Java LS resolve ANTLR types even if it doesn’t read transitive deps -->
+        <dependency>
+            <groupId>org.antlr</groupId>
+            <artifactId>antlr4-runtime</artifactId>
+            <version>4.7.2</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-nop</artifactId>
+            <version>2.0.12</version>
+            <scope>runtime</scope>
+        </dependency>
+        
+    </dependencies>
+
+    <build>
+        <plugins>
+        <!-- Build a runnable fat jar -->
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-assembly-plugin</artifactId>
+            <version>3.6.0</version>
+            <configuration>
+            <descriptorRefs>
+                <descriptorRef>jar-with-dependencies</descriptorRef>
+            </descriptorRefs>
+            <archive>
+                <manifest>
+                <mainClass>com.renova.proleap.CLI</mainClass>
+                </manifest>
+            </archive>
+            <finalName>proleap-cli-bridge-1.0.0</finalName>
+            </configuration>
+            <executions>
+            <execution>
+                <id>make-assembly</id>
+                <phase>package</phase>
+                <goals><goal>single</goal></goals>
+            </execution>
+            </executions>
+        </plugin>
+        </plugins>
+    </build>
+    </project>

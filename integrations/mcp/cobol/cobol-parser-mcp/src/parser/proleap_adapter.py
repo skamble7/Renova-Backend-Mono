@@ -1,12 +1,14 @@
-# integrations/mcp/cobol/cobol-parser-mcp/src/parser/proleap_adapter.py
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 
 # --- simple regex fallbacks ---
 _PROGRAM_ID_RE = re.compile(r"^\s*PROGRAM-ID\.\s+([A-Za-z0-9_-]+)\s*\.?", re.IGNORECASE | re.MULTILINE)
@@ -16,14 +18,59 @@ _CALL_RE       = re.compile(r"\bCALL\s+(?:\"|'|)([A-Za-z0-9][A-Za-z0-9-]*)(?:\"|
 _COPY_RE       = re.compile(r"\bCOPY\s+([A-Za-z0-9][A-Za-z0-9-]*)\b", re.IGNORECASE)
 _IO_RE         = re.compile(r"\b(OPEN|CLOSE|READ|WRITE|REWRITE|DELETE|START)\b", re.IGNORECASE)
 
+# --- neutralize unsupported EXEC blocks for ProLeap (IMS, DLI, etc.) ---
+# Replace EXEC DLI/IMS ... END-EXEC. (single statement or multiline) with a no-op.
+_EXEC_BLOCKS = [
+    re.compile(r"(?is)^\s*EXEC\s+DLI\b.*?END-EXEC\s*\.", re.MULTILINE),
+    re.compile(r"(?is)^\s*EXEC\s+IMS\b.*?END-EXEC\s*\.", re.MULTILINE),
+]
+def _neutralize_unsupported_execs(src: str) -> str:
+    out = src
+    for pat in _EXEC_BLOCKS:
+        out = pat.sub("    CONTINUE.", out)
+    return out
+
+
+def _should_dump(dump_raw_flag: bool) -> bool:
+    # If RAW_AST_DUMP_DIR is set, we default to dumping even if caller didn't pass dump_raw=True.
+    return dump_raw_flag or bool(os.environ.get("RAW_AST_DUMP_DIR"))
+
+
+def _dump_path_for(relpath: str, tool: str, suffix: str) -> Path:
+    root = os.environ.get("RAW_AST_DUMP_DIR") or "/tmp/proleap_raw"
+    safe_rel = relpath.strip("/").replace("\\", "/")
+    return Path(root) / f"{safe_rel}.{tool}{suffix}"
+
+
+def _ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _dump_text(path: Path, content: str) -> None:
+    _ensure_parent(path)
+    path.write_text(content, encoding="utf-8", errors="replace")
+
+
+def _dump_json(path: Path, obj: Any) -> None:
+    _ensure_parent(path)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _normalize_io_ops(tokens: List[str]) -> List[Dict[str, Any]]:
+    # Schema expects objects; minimally provide operation + nullable target.
+    return [{"operation": tok.upper(), "target": None} for tok in tokens]
+
 
 class ProLeapAdapter:
     """
     Program parsing: try ProLeap (classpath/CLI). Fallback to regex heuristics.
     Copybook parsing: try cb2xml (classpath/CLI). Fallback to 01-level heuristics.
 
-    We *always* enrich per-paragraph performs/calls/io via lightweight regex over
-    paragraph slices so you get edges even if the Java XML doesn’t carry them.
+    Debug dumps:
+      - Set env RAW_AST_DUMP_DIR=/mnt/work/.renova/debug/raw-ast (or anywhere)
+      - Success XML → <relpath>.<tool>.xml
+      - If CLI output isn't XML, we still dump it as <relpath>.<tool>.txt
+      - We also capture <relpath>.<tool>.attempts.json with the tried commands.
     """
 
     def __init__(self, jar_path: str | None = None) -> None:
@@ -32,49 +79,112 @@ class ProLeapAdapter:
 
     # ------------------------- Public API -------------------------
 
-    def parse_program(self, text: str, relpath: str, dialect: str) -> Dict[str, Any]:
-        # 1) Try ProLeap
-        xml_str = self._run_proleap(text, dialect)
+    def parse_program(
+        self,
+        text: str,
+        relpath: str,
+        dialect: str,
+        dump_raw: bool = False,
+        dump_dir: Optional[str] = None,  # kept for API compatibility (unused; we prefer env)
+    ) -> Dict[str, Any]:
+        want_dump = _should_dump(dump_raw)
+
+        xml_str, attempts, raw_out = self._run_proleap(text, dialect, relpath)
+        if want_dump:
+            _dump_json(_dump_path_for(relpath, "proleap", ".attempts.json"), attempts)
+            if xml_str:
+                _dump_text(_dump_path_for(relpath, "proleap", ".xml"), xml_str)
+            elif raw_out:
+                _dump_text(_dump_path_for(relpath, "proleap", ".txt"), raw_out)
+
         if xml_str:
             ast = self._from_proleap_program(xml_str, relpath)
             if ast:
-                # enrich paragraph edges via regex on paragraph slices
-                return self._enrich_program_with_regex(ast, text)
+                if want_dump:
+                    ast["_raw_dump_path"] = str(_dump_path_for(relpath, "proleap", ".xml"))
+                # never emit "notes" unless schema allows it
+                ast.pop("notes", None)
+                return ast
 
-        # 2) Fallback: cb2xml can sometimes parse programs
-        xml_str = self._run_cb2xml(text, dialect)
+        # fallback: cb2xml sometimes parses programs too; try it second
+        xml_str, attempts, raw_out = self._run_cb2xml(text, dialect, relpath, is_copybook=False)
+        if want_dump:
+            _dump_json(_dump_path_for(relpath, "cb2xml_prog", ".attempts.json"), attempts)
+            if xml_str:
+                _dump_text(_dump_path_for(relpath, "cb2xml_prog", ".xml"), xml_str)
+            elif raw_out:
+                _dump_text(_dump_path_for(relpath, "cb2xml_prog", ".txt"), raw_out)
+
         if xml_str:
             ast = self._from_cb2xml_program(xml_str, relpath)
             if ast:
-                return self._enrich_program_with_regex(ast, text)
+                if want_dump:
+                    ast["_raw_dump_path"] = str(_dump_path_for(relpath, "cb2xml_prog", ".xml"))
+                ast.pop("notes", None)
+                return ast
 
-        # 3) Final fallback: pure regex
+        # final fallback: regex
         program_id = self._guess_program_id(text) or self._program_id_from_filename(relpath)
         paragraphs = self._find_paragraphs(text)
-        para_objs = [
-            {"name": p, "performs": [], "calls": [], "io_ops": []}
-            for p in sorted(set(paragraphs))
-        ]
-        if not para_objs:
-            para_objs = [{"name": "MAIN", "performs": [], "calls": [], "io_ops": []}]
+        performs   = self._find_performs(text)
+        calls      = self._find_calls(text)
+        io_ops_all = self._find_io_ops(text)
+        copybooks  = self._find_copybooks(text)
 
-        tmp_ast = {
+        para_objs = [
+            {
+                "name": p,
+                "performs": sorted(performs.get(p, [])),
+                "calls": [],
+                # We don't have paragraph-scoped IO today; keep empty array (schema allows []).
+                "io_ops": [],
+            }
+            for p in sorted(set(paragraphs))
+        ] or [{"name": "MAIN", "performs": [], "calls": [], "io_ops": []}]
+
+        ast: Dict[str, Any] = {
             "type": "program",
             "program_id": program_id,
             "divisions": {"identification": {}, "environment": {}, "data": {}, "procedure": {}},
             "paragraphs": para_objs,
-            "copybooks_used": sorted(self._find_copybooks(text)),
+            "copybooks_used": sorted(copybooks),
+            # rollup fields for debugging/consumers; keep underscore-namespaced
+            "_calls_all": sorted(calls),
+            "_io_ops_all": _normalize_io_ops(sorted(set(io_ops_all))),
         }
-        return self._enrich_program_with_regex(tmp_ast, text)
+        # ensure no stray "notes"
+        ast.pop("notes", None)
+        return ast
 
-    def parse_copybook(self, text: str, relpath: str, dialect: str) -> Dict[str, Any]:
-        xml_str = self._run_cb2xml(text, dialect, is_copybook=True)
+    def parse_copybook(
+        self,
+        text: str,
+        relpath: str,
+        dialect: str,
+        dump_raw: bool = False,
+        dump_dir: Optional[str] = None,  # kept for API compatibility (unused; we prefer env)
+    ) -> Dict[str, Any]:
+        want_dump = _should_dump(dump_raw)
+
+        xml_str, attempts, raw_out = self._run_cb2xml(text, dialect, relpath, is_copybook=True)
+        if want_dump:
+            _dump_json(_dump_path_for(relpath, "cb2xml_copy", ".attempts.json"), attempts)
+            if xml_str:
+                _dump_text(_dump_path_for(relpath, "cb2xml_copy", ".xml"), xml_str)
+            elif raw_out:
+                _dump_text(_dump_path_for(relpath, "cb2xml_copy", ".txt"), raw_out)
+
         name = self._copybook_name_from_filename(relpath)
 
         if xml_str:
             items = self._from_cb2xml_copybook_items(xml_str)
             if items:
-                return {"type": "copybook", "name": name, "items": items}
+                res: Dict[str, Any] = {"type": "copybook", "name": name, "items": items}
+                if want_dump:
+                    res["_raw_dump_path"] = str(_dump_path_for(relpath, "cb2xml_copy", ".xml"))
+                # never emit "notes"
+                res.pop("notes", None)
+                return res
 
         # fallback: regex
         items = self._heuristic_copybook_items(text, name)
@@ -82,78 +192,95 @@ class ProLeapAdapter:
 
     # ------------------------- Java runners -------------------------
 
-    def _run_proleap(self, cobol_src: str, dialect: str) -> Optional[str]:
+    def _run_proleap(self, cobol_src: str, dialect: str, relpath: str) -> Tuple[Optional[str], list, str]:
         """
-        Run ProLeap via classpath. We try:
-          - env PROLEAP_CLASSPATH (or /opt/proleap/lib/*)
-          - env PROLEAP_MAIN if set, else a list of candidate main classes.
+        Run ProLeap via classpath. Prefer the bridge CLI (com.renova.proleap.CLI).
         Accepts stdin if supported, else temp-file mode.
+
+        Returns: (xml_or_none, attempts[], raw_combined_text)
         """
-        cp = os.environ.get("PROLEAP_CLASSPATH", "").strip() or "/opt/proleap/lib/*"
-        mains = [os.environ.get("PROLEAP_MAIN", "").strip()] if os.environ.get("PROLEAP_MAIN") else []
-        mains += [
-            # Common candidates seen across versions/forks:
-            "org.proleap.cobol.tool.CobolParserCLI",
-            "org.proleap.cobol.tool.CLI",
-            "org.proleap.cobol.CobolParserCLI",
-            "org.proleap.cobol.tool.CobolMain",
-        ]
-        mains = [m for m in mains if m]
+        attempts: List[Dict[str, Any]] = []
+        combined_text_out = ""
+
+        # Prefer the bridge jar & main.
+        cp = (os.environ.get("PROLEAP_CLASSPATH") or "/opt/proleap/lib/proleap-cli-bridge.jar").strip()
+        main = (os.environ.get("PROLEAP_MAIN") or "com.renova.proleap.CLI").strip()
+        mains = [m for m in [main] if m]
 
         env = os.environ.copy()
         env["COBOL_DIALECT"] = dialect
 
-        # Try stdin first
-        for main in mains:
-            for flag in ("-stdin", "--stdin"):
+        def _try_stdin(src: str, tag: str) -> Tuple[Optional[str], str]:
+            cmd = ["java", "-cp", cp, mains[0], "-stdin"]
+            attempts.append({"mode": "stdin", "cmd": cmd, tag: True})
+            try:
+                out = subprocess.check_output(cmd, input=src.encode("utf-8"),
+                                              stderr=subprocess.STDOUT, env=env)
+                s = out.decode("utf-8", errors="replace")
+                return (s if s.strip().startswith("<") else None, f"\n# {cmd}\n{s}\n")
+            except subprocess.CalledProcessError as e:
+                msg = e.output.decode("utf-8", errors="replace") if e.output else str(e)
+                return (None, f"\n# {cmd} FAILED (exit {e.returncode}):\n{msg}\n")
+            except Exception as e:
+                return (None, f"\n# {cmd} FAILED (exception): {e}\n")
+
+        def _try_file(src: str, tag: str) -> Tuple[Optional[str], str]:
+            out_log = ""
+            with tempfile.NamedTemporaryFile(prefix="proleap_in_", suffix=".cbl", delete=False) as tmp:
+                tmp.write(src.encode("utf-8")); tmp.flush()
+                in_path = tmp.name
+            try:
+                for args in ([in_path], ["-xml", in_path], ["--xml", in_path]):
+                    cmd = ["java", "-cp", cp, mains[0], *args]
+                    attempts.append({"mode": "file", "cmd": cmd, tag: True})
+                    try:
+                        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env)
+                        s = out.decode("utf-8", errors="replace")
+                        out_log += f"\n# {cmd}\n{s}\n"
+                        if s.strip().startswith("<"):
+                            return s, out_log
+                    except subprocess.CalledProcessError as e:
+                        msg = e.output.decode("utf-8", errors="replace") if e.output else str(e)
+                        out_log += f"\n# {cmd} FAILED (exit {e.returncode}):\n{msg}\n"
+                    except Exception as e:
+                        out_log += f"\n# {cmd} FAILED (exception): {e}\n"
+            finally:
                 try:
-                    out = subprocess.check_output(
-                        ["java", "-cp", cp, main, flag],
-                        input=cobol_src.encode("utf-8"),
-                        stderr=subprocess.STDOUT,
-                        env=env,
-                    )
-                    xml = out.decode("utf-8", errors="replace")
-                    if xml.strip().startswith("<"):
-                        return xml
+                    os.remove(in_path)
                 except Exception:
                     pass
+            return None, out_log
 
-        # Temp file fallback (some CLIs don’t take stdin)
-        with tempfile.NamedTemporaryFile(prefix="proleap_in_", suffix=".cbl", delete=False) as tmp:
-            tmp.write(cobol_src.encode("utf-8"))
-            tmp.flush()
-            in_path = tmp.name
-        try:
-            for main in mains:
-                for args in (
-                    [in_path],                # plain file → stdout xml (some builds)
-                    ["-xml", in_path],
-                    ["--xml", in_path],
-                ):
-                    try:
-                        out = subprocess.check_output(
-                            ["java", "-cp", cp, main, *args],
-                            stderr=subprocess.STDOUT,
-                            env=env,
-                        )
-                        xml = out.decode("utf-8", errors="replace")
-                        if xml.strip().startswith("<"):
-                            return xml
-                    except Exception:
-                        pass
-        finally:
-            try:
-                os.remove(in_path)
-            except Exception:
-                pass
+        # 1) Try original source via stdin, then file
+        s, log = _try_stdin(cobol_src, "original")
+        combined_text_out += log
+        if s:
+            return s, attempts, combined_text_out
 
-        return None
+        s, log = _try_file(cobol_src, "original")
+        combined_text_out += log
+        if s:
+            return s, attempts, combined_text_out
 
-    def _run_cb2xml(self, cobol_src: str, dialect: str, is_copybook: bool = False) -> Optional[str]:
-        """
-        Run cb2xml via classpath. Works with cb2xml zips that ship libraries without a manifest.
-        """
+        # 2) If we saw IMS markers (or proactively), sanitize and retry once
+        if any(p.search(cobol_src) for p in _EXEC_BLOCKS) or "EXEC DLI" in cobol_src.upper() or "EXEC IMS" in cobol_src.upper() or "EXEC DLI" in combined_text_out.upper() or "EXEC IMS" in combined_text_out.upper():
+            sanitized = _neutralize_unsupported_execs(cobol_src)
+            s, log = _try_stdin(sanitized, "sanitized_exec")
+            combined_text_out += log
+            if s:
+                return s, attempts, combined_text_out + "\n[SANITIZED RETRY OK]"
+
+            s, log = _try_file(sanitized, "sanitized_exec")
+            combined_text_out += log
+            if s:
+                return s, attempts, combined_text_out + "\n[SANITIZED RETRY OK]"
+
+        return None, attempts, combined_text_out.strip()
+
+    def _run_cb2xml(self, cobol_src: str, dialect: str, relpath: str, is_copybook: bool) -> tuple[Optional[str], list, str]:
+        attempts: List[Dict[str, Any]] = []
+        combined_text_out = ""
+
         cp = os.environ.get("CB2XML_CLASSPATH", "").strip() or "/opt/cb2xml/lib/*"
         mains = [os.environ.get("CB2XML_MAIN", "").strip()] if os.environ.get("CB2XML_MAIN") else []
         mains += ["net.sf.cb2xml.Cb2Xml", "net.sf.cb2xml.Cb2Xml2", "net.sf.cb2xml.cli.CLI"]
@@ -165,55 +292,58 @@ class ProLeapAdapter:
         # Try stdin first
         for main in mains:
             for flag in ("-stdin", "--stdin"):
+                cmd = ["java", "-cp", cp, main, flag]
+                attempts.append({"mode": "stdin", "cmd": cmd, "is_copybook": is_copybook})
                 try:
                     out = subprocess.check_output(
-                        ["java", "-cp", cp, main, flag],
-                        input=cobol_src.encode("utf-8"),
-                        stderr=subprocess.STDOUT,
-                        env=env,
+                        cmd, input=cobol_src.encode("utf-8"),
+                        stderr=subprocess.STDOUT, env=env
                     )
-                    xml = out.decode("utf-8", errors="replace")
-                    if xml.strip().startswith("<"):
-                        return xml
-                except Exception:
-                    pass
+                    s = out.decode("utf-8", errors="replace")
+                    combined_text_out += f"\n# {cmd}\n{s}\n"
+                    if s.strip().startswith("<"):
+                        return s, attempts, combined_text_out
+                except subprocess.CalledProcessError as e:
+                    msg = e.output.decode("utf-8", errors="replace") if e.output else str(e)
+                    combined_text_out += f"\n# {cmd} FAILED (exit {e.returncode}):\n{msg}\n"
+                except Exception as e:
+                    combined_text_out += f"\n# {cmd} FAILED (exception): {e}\n"
 
         # Temp file fallback
-        with tempfile.NamedTemporaryFile(prefix="cb2xml_in_", suffix=".cob", delete=False) as tmp:
+        suffix = ".cpy" if is_copybook else ".cob"
+        with tempfile.NamedTemporaryFile(prefix="cb2xml_in_", suffix=suffix, delete=False) as tmp:
             tmp.write(cobol_src.encode("utf-8"))
             tmp.flush()
             in_path = tmp.name
         try:
             for main in mains:
-                for args in (
-                    [in_path],
-                    ["-xml", in_path],
-                    ["--xml", in_path],
-                ):
+                for args in ([in_path], ["-xml", in_path], ["--xml", in_path]):
+                    cmd = ["java", "-cp", cp, main, *args]
+                    attempts.append({"mode": "file", "cmd": cmd, "is_copybook": is_copybook})
                     try:
-                        out = subprocess.check_output(
-                            ["java", "-cp", cp, main, *args],
-                            stderr=subprocess.STDOUT,
-                            env=env,
-                        )
-                        xml = out.decode("utf-8", errors="replace")
-                        if xml.strip().startswith("<"):
-                            return xml
-                    except Exception:
-                        pass
+                        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env)
+                        s = out.decode("utf-8", errors="replace")
+                        combined_text_out += f"\n# {cmd}\n{s}\n"
+                        if s.strip().startswith("<"):
+                            return s, attempts, combined_text_out
+                    except subprocess.CalledProcessError as e:
+                        msg = e.output.decode("utf-8", errors="replace") if e.output else str(e)
+                        combined_text_out += f"\n# {cmd} FAILED (exit {e.returncode}):\n{msg}\n"
+                    except Exception as e:
+                        combined_text_out += f"\n# {cmd} FAILED (exception): {e}\n"
         finally:
             try:
                 os.remove(in_path)
             except Exception:
                 pass
 
-        return None
+        return None, attempts, combined_text_out.strip()
 
     # ------------------------- XML → AST -------------------------
 
     def _from_proleap_program(self, xml_str: str, relpath: str) -> Optional[Dict[str, Any]]:
         """
-        ProLeap’s XML schema differs by version. Be defensive: pull just what we need.
+        ProLeap XML varies by version; be defensive.
         """
         try:
             root = ET.fromstring(xml_str)
@@ -227,7 +357,7 @@ class ProLeapAdapter:
         para_names = set()
         for tag in ("paragraph", "Paragraph", "para", "paragraphName"):
             for node in root.findall(f".//{tag}"):
-                nm = (node.get("name") or node.text or "").strip()
+                nm = (node.get("name") or (node.text or "")).strip()
                 if nm:
                     para_names.add(nm.upper())
 
@@ -238,7 +368,7 @@ class ProLeapAdapter:
         copybooks = set()
         for tag in ("copy", "copybook", "COPY"):
             for node in root.findall(f".//{tag}"):
-                nm = (node.get("name") or node.text or "").strip()
+                nm = (node.get("name") or (node.text or "")).strip()
                 if nm:
                     copybooks.add(nm.upper())
 
@@ -251,7 +381,6 @@ class ProLeapAdapter:
         }
 
     def _from_cb2xml_program(self, xml_str: str, relpath: str) -> Optional[Dict[str, Any]]:
-        # very similar to ProLeap since we only consume light structure
         try:
             root = ET.fromstring(xml_str)
         except ET.ParseError:
@@ -263,7 +392,7 @@ class ProLeapAdapter:
         para_names = set()
         for tag in ("paragraph", "Paragraph", "para", "paragraphName"):
             for node in root.findall(f".//{tag}"):
-                nm = (node.get("name") or node.text or "").strip()
+                nm = (node.get("name") or (node.text or "")).strip()
                 if nm:
                     para_names.add(nm.upper())
 
@@ -273,7 +402,7 @@ class ProLeapAdapter:
         copybooks = set()
         for tag in ("copy", "copybook", "COPY"):
             for node in root.findall(f".//{tag}"):
-                nm = (node.get("name") or node.text or "").strip()
+                nm = (node.get("name") or (node.text or "")).strip()
                 if nm:
                     copybooks.add(nm.upper())
 
@@ -298,69 +427,6 @@ class ProLeapAdapter:
             if level == "01" and name:
                 items.append({"level": "01", "name": name.upper(), "picture": "", "children": []})
         return items or None
-
-    # ------------------------- Regex enrichment -------------------------
-
-    def _enrich_program_with_regex(self, ast: Dict[str, Any], full_text: str) -> Dict[str, Any]:
-        """
-        Take a skeleton program AST and fill per-paragraph performs/calls/io edges by
-        slicing the source text into paragraph bodies and scanning each slice.
-        """
-        paragraphs: List[Dict[str, Any]] = ast.get("paragraphs") or []
-        if not paragraphs:
-            paragraphs = [{"name": "MAIN", "performs": [], "calls": [], "io_ops": []}]
-
-        # Build paragraph spans from the source text
-        # We find all paragraph labels & their byte/char offsets
-        labels = []
-        for m in _PARAGRAPH_RE.finditer(full_text):
-            name = m.group(1).upper()
-            labels.append((name, m.start(), m.end()))
-        # map name -> (start, end) where end is start of next paragraph or EOF
-        spans: Dict[str, tuple[int, int]] = {}
-        for i, (name, start, _end) in enumerate(labels):
-            next_start = len(full_text)
-            if i + 1 < len(labels):
-                next_start = labels[i + 1][1]
-            spans[name] = (start, next_start)
-
-        # Helper to slice text for a given paragraph
-        def slice_for(name: str) -> str:
-            s = spans.get(name.upper())
-            if s:
-                return full_text[s[0]:s[1]]
-            # If we didn't find an explicit label span, scan whole file (best-effort)
-            return full_text
-
-        # Compute a global set of copybooks as a safety net (union with XML)
-        copybooks_union = set(ast.get("copybooks_used") or [])
-        copybooks_union |= set(self._find_copybooks(full_text))
-
-        # Fill each paragraph
-        out_paras: List[Dict[str, Any]] = []
-        for p in paragraphs:
-            name = (p.get("name") or "").upper()
-            body = slice_for(name) if name else full_text
-
-            # performs/calls/io within the paragraph body
-            perf_targets = [m.group(1).upper() for m in _PERFORM_RE.finditer(body)]
-            calls        = [m.group(1).upper() for m in _CALL_RE.finditer(body)]
-            io_ops       = [m.group(1).upper() for m in _IO_RE.finditer(body)]
-
-            out_paras.append({
-                "name": name or (p.get("name") or ""),
-                "performs": sorted(set(perf_targets)),
-                "calls": sorted(set(calls)),
-                "io_ops": sorted(set(io_ops)),
-            })
-
-        return {
-            "type": "program",
-            "program_id": ast.get("program_id", ""),
-            "divisions": ast.get("divisions") or {"identification": {}, "environment": {}, "data": {}, "procedure": {}},
-            "paragraphs": out_paras,
-            "copybooks_used": sorted(copybooks_union),
-        }
 
     # ------------------------- Heuristics -------------------------
 
@@ -395,6 +461,10 @@ class ProLeapAdapter:
             if n not in seen:
                 ordered.append(n); seen.add(n)
         return ordered
+
+    def _find_performs(self, text: str) -> Dict[str, List[str]]:
+        targets = [m.group(1).upper() for m in _PERFORM_RE.finditer(text)]
+        return {"MAIN": sorted(set(targets))} if targets else {}
 
     def _find_calls(self, text: str) -> List[str]:
         return sorted({m.group(1).upper() for m in _CALL_RE.finditer(text)})

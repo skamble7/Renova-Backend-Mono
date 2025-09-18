@@ -6,7 +6,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openjdk-21-jre-headless tini ca-certificates bash \
     coreutils unzip \
  && rm -rf /var/lib/apt/lists/*
- 
 
 WORKDIR /opt/renova/tools/cobol-parser
 
@@ -17,14 +16,17 @@ RUN chmod 0644 /opt/cb2xml/lib/*.jar || true
 
 # ---- add ProLeap jars (classpath-based)
 RUN mkdir -p /opt/proleap/lib
+# Make sure your fat JAR is present at vendor/proleap/lib/proleap-cli-bridge.jar
+# (Tip: copy/rename your -jar-with-dependencies.jar to that filename before building)
 COPY vendor/proleap/lib/*.jar /opt/proleap/lib/
 RUN chmod 0644 /opt/proleap/lib/*.jar || true
 
 # Classpath envs the adapter will use (can be overridden in mcp.json)
 ENV CB2XML_CLASSPATH="/opt/cb2xml/lib/*" \
     CB2XML_MAIN="net.sf.cb2xml.Cb2Xml" \
-    PROLEAP_CLASSPATH="/opt/proleap/lib/*" \
-    PROLEAP_MAIN="org.proleap.cobol.tool.CobolParserCLI"
+    # ▼▼ important: point to your wrapper JAR and main
+    PROLEAP_CLASSPATH="/opt/proleap/lib/proleap-cli-bridge.jar" \
+    PROLEAP_MAIN="com.renova.proleap.CLI"
 
 # python deps
 RUN pip install --no-cache-dir \

@@ -1,4 +1,3 @@
-# integrations/mcp/cobol/cobol-parser-mcp/src/main.py
 from __future__ import annotations
 
 import argparse
@@ -19,16 +18,13 @@ from src.parser.normalizer import normalize_copybook, normalize_program
 
 _shutdown = False
 
-
 # ----------------------------- Signals ---------------------------------
 def _sigterm_handler(signum, frame):
     global _shutdown
     _shutdown = True
 
-
 signal.signal(signal.SIGTERM, _sigterm_handler)
 signal.signal(signal.SIGINT, _sigterm_handler)
-
 
 # --------------------------- Path Normalizer ---------------------------
 def _normalize_root(root: str) -> str:
@@ -74,7 +70,6 @@ def _normalize_root(root: str) -> str:
         return r
     return os.path.join(ws_ctr, r.lstrip("/"))
 
-
 # ------------------------------ Tools ----------------------------------
 def list_tools() -> Dict[str, Any]:
     return {
@@ -94,8 +89,17 @@ def list_tools() -> Dict[str, Any]:
                             "default": "COBOL85",
                         },
                         "use_source_index": {"type": "boolean", "default": True},
+                        "debug_raw": {
+                            "type": "boolean",
+                            "description": "If true, dump raw ProLeap/cb2xml XML ASTs to disk.",
+                            "default": False
+                        },
+                        "raw_dump_dir": {
+                            "type": "string",
+                            "description": "Directory root for raw AST dumps. Defaults to /tmp/proleap_raw (or RAW_AST_DUMP_DIR env)."
+                        },
                     },
-                    "additionalProperties": False,
+                    "additionalProperties": False
                 },
             }
         ]
@@ -110,6 +114,8 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
     root = _normalize_root(root)
     dialect = inp.get("dialect", "COBOL85")
     allow_paths = inp.get("paths") or []
+    debug_raw: bool = bool(inp.get("debug_raw", False))
+    raw_dump_dir: str = inp.get("raw_dump_dir") or os.environ.get("RAW_AST_DUMP_DIR") or "/tmp/proleap_raw"
 
     diagnostics: List[Dict[str, Any]] = []
     artifacts: List[Dict[str, Any]] = []
@@ -117,13 +123,12 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
         "files_scanned": 0,
         "programs_emitted": 0,
         "copybooks_emitted": 0,
-        "parser_version": "normalizer=1.0.0,adapter=proleap/0.0.1",
+        "parser_version": "normalizer=1.0.0,adapter=proleap/0.0.2",
+        "raw_dump_dir": raw_dump_dir if debug_raw else "",
     }
 
     if not os.path.isdir(root):
-        diagnostics.append(
-            {"level": "error", "relpath": "", "message": f"Root not a directory: {root}"}
-        )
+        diagnostics.append({"level": "error", "relpath": "", "message": f"Root not a directory: {root}"})
         return {"artifacts": [], "diagnostics": diagnostics, "stats": stats}
 
     schema_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "schemas"))
@@ -139,52 +144,59 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
             with open(abs_p, "rb") as f:
                 raw = f.read()
         except Exception as e:
-            diagnostics.append(
-                {"level": "warning", "relpath": rel_p, "message": f"Read error: {e}"}
-            )
+            diagnostics.append({"level": "warning", "relpath": rel_p, "message": f"Read error: {e}"})
             continue
 
         enc, payload = detect_encoding(raw)
         try:
             text = payload.decode(enc, errors="strict")
         except Exception as e:
-            diagnostics.append(
-                {"level": "warning", "relpath": rel_p, "message": f"Decode failed ({enc}): {e}"}
-            )
+            diagnostics.append({"level": "warning", "relpath": rel_p, "message": f"Decode failed ({enc}): {e}"})
             continue
 
         content_hash = sha256_bytes(payload)
 
         if kind == "cobol":
-            ast = adapter.parse_program(text=text, relpath=rel_p, dialect=dialect)
+            ast = adapter.parse_program(
+                text=text,
+                relpath=rel_p,
+                dialect=dialect,
+                dump_raw=debug_raw,
+                dump_dir=raw_dump_dir,
+            )
             data = normalize_program(ast, relpath=rel_p, sha256=content_hash)
+            # surface raw dump path in notes (non-fatal, best-effort)
+            dump_note = ast.get("_raw_dump_path")
+            if dump_note:
+                (data.setdefault("notes", [])).append({"kind": "raw-ast", "tool": "proleap/cb2xml", "path": dump_note})
+
             artifact = {"kind": "cam.cobol.program", "version": "1.0.0", "data": data}
             errors = registry.validate(artifact)
             if errors:
-                diagnostics.append(
-                    {
-                        "level": "warning",
-                        "relpath": rel_p,
-                        "message": f"Schema: {errors[:3]}{'...' if len(errors)>3 else ''}",
-                    }
-                )
+                diagnostics.append({"level": "warning", "relpath": rel_p,
+                                    "message": f"Schema: {errors[:3]}{'...' if len(errors)>3 else ''}"})
             else:
                 stats["programs_emitted"] += 1
                 artifacts.append(artifact)
 
         elif kind == "copybook":
-            ast = adapter.parse_copybook(text=text, relpath=rel_p, dialect=dialect)
+            ast = adapter.parse_copybook(
+                text=text,
+                relpath=rel_p,
+                dialect=dialect,
+                dump_raw=debug_raw,
+                dump_dir=raw_dump_dir,
+            )
             data = normalize_copybook(ast, relpath=rel_p, sha256=content_hash)
+            dump_note = ast.get("_raw_dump_path")
+            if dump_note:
+                (data.setdefault("notes", [])).append({"kind": "raw-ast", "tool": "cb2xml", "path": dump_note})
+
             artifact = {"kind": "cam.cobol.copybook", "version": "1.0.0", "data": data}
             errors = registry.validate(artifact)
             if errors:
-                diagnostics.append(
-                    {
-                        "level": "warning",
-                        "relpath": rel_p,
-                        "message": f"Schema: {errors[:3]}{'...' if len(errors)>3 else ''}",
-                    }
-                )
+                diagnostics.append({"level": "warning", "relpath": rel_p,
+                                    "message": f"Schema: {errors[:3]}{'...' if len(errors)>3 else ''}"})
             else:
                 stats["copybooks_emitted"] += 1
                 artifacts.append(artifact)
@@ -198,24 +210,14 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
     artifacts.sort(key=_sort_key)
     return {"artifacts": artifacts, "diagnostics": diagnostics, "stats": stats}
 
-
 # ------------------------------ Protocol --------------------------------
 def _send(obj: Dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
-
-def _send_error(
-    id_val: Any, code: int, message: str, data: Dict[str, Any] | None = None
-) -> None:
-    _send(
-        {
-            "jsonrpc": "2.0",
-            "id": id_val,
-            "error": {"code": code, "message": message, "data": data or {}},
-        }
-    )
-
+def _send_error(id_val: Any, code: int, message: str, data: Dict[str, Any] | None = None) -> None:
+    _send({"jsonrpc": "2.0", "id": id_val,
+           "error": {"code": code, "message": message, "data": data or {}}})
 
 def _handle_initialize(msg: Dict[str, Any]) -> None:
     result = {
@@ -225,18 +227,14 @@ def _handle_initialize(msg: Dict[str, Any]) -> None:
     }
     _send({"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
 
-
 def _handle_initialized(_msg: Dict[str, Any]) -> None:
     return
-
 
 def _handle_shutdown(msg: Dict[str, Any]) -> None:
     _send({"jsonrpc": "2.0", "id": msg.get("id"), "result": None})
 
-
 def _handle_tools_list(msg: Dict[str, Any]) -> None:
     _send({"jsonrpc": "2.0", "id": msg.get("id"), "result": list_tools()})
-
 
 def _handle_tools_call(msg: Dict[str, Any]) -> None:
     params = msg.get("params") or {}
@@ -251,31 +249,28 @@ def _handle_tools_call(msg: Dict[str, Any]) -> None:
         res = parse_tree(arguments)
         st = res.get("stats", {})
         diags = res.get("diagnostics", [])
+        dump_dir = st.get("raw_dump_dir") or ""
+        extra = f" Raw ASTs in: {dump_dir}" if dump_dir else ""
         summary = (
             f"COBOL parse complete. Scanned={st.get('files_scanned', 0)}, "
             f"programs={st.get('programs_emitted', 0)}, "
             f"copybooks={st.get('copybooks_emitted', 0)}, "
-            f"diagnostics={len(diags)}."
+            f"diagnostics={len(diags)}.{extra}"
         )
-        _send(
-            {
-                "jsonrpc": "2.0",
-                "id": msg.get("id"),
-                "result": {
-                    "content": [{"type": "text", "text": summary}],
-                    "structuredContent": res,
-                },
+        _send({
+            "jsonrpc": "2.0",
+            "id": msg.get("id"),
+            "result": {
+                "content": [{"type": "text", "text": summary}],
+                "structuredContent": res
             }
-        )
+        })
     except Exception as e:
-        _send(
-            {
-                "jsonrpc": "2.0",
-                "id": msg.get("id"),
-                "result": {"content": [{"type": "text", "text": str(e)}], "isError": True},
-            }
-        )
-
+        _send({
+            "jsonrpc": "2.0",
+            "id": msg.get("id"),
+            "result": {"content": [{"type": "text", "text": str(e)}], "isError": True}
+        })
 
 def run_stdio_loop() -> None:
     print("mcp server ready", file=sys.stderr, flush=True)
@@ -307,7 +302,6 @@ def run_stdio_loop() -> None:
         else:
             _send_error(msg.get("id"), -32601, f"Unknown method: {method}")
 
-
 # -------------------------------- Main ---------------------------------
 def main(argv: List[str] | None = None) -> int:
     ap = argparse.ArgumentParser("cobol-parser-mcp")
@@ -315,7 +309,6 @@ def main(argv: List[str] | None = None) -> int:
     _ = ap.parse_args(argv)
     run_stdio_loop()
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
