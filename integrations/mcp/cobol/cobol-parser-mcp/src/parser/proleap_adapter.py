@@ -1,3 +1,4 @@
+# integrations/mcp/cobol/cobol-parser-mcp/src/parser/proleap_adapter.py
 from __future__ import annotations
 
 import json
@@ -10,15 +11,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from functools import lru_cache
 
-
-
-# --- simple regex fallbacks ---
+# --- simple regex fallbacks / scanners ---
 _PROGRAM_ID_RE = re.compile(r"^\s*PROGRAM-ID\.\s+([A-Za-z0-9_-]+)\s*\.?", re.IGNORECASE | re.MULTILINE)
-_PARAGRAPH_RE  = re.compile(r"(?m)^\s{0,8}([A-Za-z0-9][A-Za-z0-9-]*)\s*\.\s*$")
-_PERFORM_RE    = re.compile(r"\bPERFORM\s+([A-Za-z0-9][A-Za-z0-9-]*)\b", re.IGNORECASE)
-_CALL_RE       = re.compile(r"\bCALL\s+(?:\"|'|)([A-Za-z0-9][A-Za-z0-9-]*)(?:\"|'|)\b", re.IGNORECASE)
-_COPY_RE       = re.compile(r"\bCOPY\s+([A-Za-z0-9][A-Za-z0-9-]*)\b", re.IGNORECASE)
-_IO_RE         = re.compile(r"\b(OPEN|CLOSE|READ|WRITE|REWRITE|DELETE|START)\b", re.IGNORECASE)
+# Label line: paragraph name followed by a period on its own line (area A/B tolerant)
+_PARA_LABEL_RE  = re.compile(r"(?m)^(?P<indent>\s{0,8})(?P<name>[A-Za-z0-9][A-Za-z0-9-]*)\s*\.\s*$")
+# Statement finders used inside blocks
+_PERFORM_RE     = re.compile(r"\bPERFORM\s+([A-Za-z0-9][A-Za-z0-9-]*)\b", re.IGNORECASE)
+_CALL_RE        = re.compile(r"\bCALL\s+(?:\"|')?([A-Za-z0-9][A-Za-z0-9-]*)(?:\"|')?\b", re.IGNORECASE)
+_COPY_RE        = re.compile(r"\bCOPY\s+([A-Za-z0-9][A-Za-z0-9-]*)\b", re.IGNORECASE)
+_IO_RE          = re.compile(r"\b(OPEN|CLOSE|READ|WRITE|REWRITE|DELETE|START)\b", re.IGNORECASE)
+
+# Division sentinels
+_DIV_IDENT   = re.compile(r"(?im)^\s*IDENTIFICATION\s+DIVISION\.", re.MULTILINE)
+_DIV_ENV     = re.compile(r"(?im)^\s*ENVIRONMENT\s+DIVISION\.", re.MULTILINE)
+_DIV_DATA    = re.compile(r"(?im)^\s*DATA\s+DIVISION\.", re.MULTILINE)
+_DIV_PROC    = re.compile(r"(?im)^\s*PROCEDURE\s+DIVISION\.", re.MULTILINE)
 
 @lru_cache(maxsize=1024)
 def _read_copy_candidate(abs_path: str) -> Optional[str]:
@@ -31,8 +38,7 @@ def _read_copy_candidate(abs_path: str) -> Optional[str]:
 def _expand_copys(text: str, relpath: str, copy_dirs: List[str]) -> str:
     """
     Very small include preprocessor for `COPY NAME.` lines.
-    Supports: bare `COPY NAME.` on its own line.
-    Does NOT implement REPLACING (we can add common patterns later).
+    Supports bare `COPY NAME.` lines. Does NOT implement REPLACING.
     """
     if not copy_dirs:
         return text
@@ -43,8 +49,8 @@ def _expand_copys(text: str, relpath: str, copy_dirs: List[str]) -> str:
         m = _COPY_RE.search(ln)
         if m and ln.strip().upper().endswith("."):
             name = m.group(1)
-            # try NAME.cpy / NAME.CPY / NAME.copy
-            candidates = []
+            # try NAME.cpy / NAME.CPY / NAME.copy / NAME.COPY
+            candidates: List[str] = []
             for d in copy_dirs:
                 for ext in (".cpy", ".CPY", ".copy", ".COPY"):
                     candidates.append(os.path.join(d, f"{name}{ext}"))
@@ -55,7 +61,7 @@ def _expand_copys(text: str, relpath: str, copy_dirs: List[str]) -> str:
                     included = s
                     break
             if included is not None:
-                # naive include; retain a marker comment
+                # naive include; retain a marker comment for dumps
                 out.append(f"      *COPY {name}*.\n")
                 out.append(included if included.endswith("\n") else included + "\n")
                 continue
@@ -63,7 +69,6 @@ def _expand_copys(text: str, relpath: str, copy_dirs: List[str]) -> str:
     return "".join(out)
 
 # --- neutralize unsupported EXEC blocks for ProLeap (IMS, DLI, etc.) ---
-# Replace EXEC DLI/IMS ... END-EXEC. (single statement or multiline) with a no-op.
 _EXEC_BLOCKS = [
     re.compile(r"(?is)^\s*EXEC\s+DLI\b.*?END-EXEC\s*\.", re.MULTILINE),
     re.compile(r"(?is)^\s*EXEC\s+IMS\b.*?END-EXEC\s*\.", re.MULTILINE),
@@ -74,36 +79,86 @@ def _neutralize_unsupported_execs(src: str) -> str:
         out = pat.sub("    CONTINUE.", out)
     return out
 
-
 def _should_dump(dump_raw_flag: bool) -> bool:
-    # If RAW_AST_DUMP_DIR is set, we default to dumping even if caller didn't pass dump_raw=True.
+    # If RAW_AST_DUMP_DIR is set, dump even if caller didn't pass dump_raw=True.
     return dump_raw_flag or bool(os.environ.get("RAW_AST_DUMP_DIR"))
-
 
 def _dump_path_for(relpath: str, tool: str, suffix: str) -> Path:
     root = os.environ.get("RAW_AST_DUMP_DIR") or "/tmp/proleap_raw"
     safe_rel = relpath.strip("/").replace("\\", "/")
     return Path(root) / f"{safe_rel}.{tool}{suffix}"
 
-
 def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-
 
 def _dump_text(path: Path, content: str) -> None:
     _ensure_parent(path)
     path.write_text(content, encoding="utf-8", errors="replace")
 
-
 def _dump_json(path: Path, obj: Any) -> None:
     _ensure_parent(path)
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
-
 def _normalize_io_ops(tokens: List[str]) -> List[Dict[str, Any]]:
-    # Schema expects objects; minimally provide operation + nullable target.
-    return [{"operation": tok.upper(), "target": None} for tok in tokens]
+    # Shape for schema: {"op": "...", "dataset_ref": "", "fields": []}
+    return [{"op": tok.upper(), "dataset_ref": "", "fields": []} for tok in tokens]
 
+# --------- enrichment from raw source: blocks, edges, divisions ----------
+def _paragraph_blocks(text: str) -> List[Tuple[str, int, int]]:
+    """
+    Return ordered (NAME, start_idx, end_idx) blocks detected by paragraph labels.
+    If no labels, return a single MAIN block spanning full text.
+    """
+    blocks: List[Tuple[str, int, int]] = []
+    matches = list(_PARA_LABEL_RE.finditer(text))
+    if not matches:
+        return [("MAIN", 0, len(text))]
+    for i, m in enumerate(matches):
+        name = m.group("name").upper()
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        blocks.append((name, start, end))
+    return blocks
+
+def _detect_divisions(text: str, program_id: Optional[str]) -> Dict[str, Any]:
+    d: Dict[str, Any] = {"identification": {}, "environment": {}, "data": {}, "procedure": {}}
+    if _DIV_IDENT.search(text):
+        if program_id:
+            d["identification"]["program_id"] = program_id
+        d["identification"]["present"] = True
+    if _DIV_ENV.search(text):  d["environment"]["present"] = True
+    if _DIV_DATA.search(text): d["data"]["present"] = True
+    if _DIV_PROC.search(text): d["procedure"]["present"] = True
+    return d
+
+def _edges_from_text(text: str) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+    """
+    Compute paragraph array with per-block performs/calls/io_ops,
+    plus rollups: all calls and all io tokens (as lists of strings for debug).
+    """
+    blocks = _paragraph_blocks(text)
+    all_calls: List[str] = []
+    all_io: List[str] = []
+    paragraphs: List[Dict[str, Any]] = []
+
+    for name, s, e in blocks:
+        body = text[s:e]
+        performs = sorted({m.group(1).upper() for m in _PERFORM_RE.finditer(body)})
+        calls    = sorted({m.group(1).upper() for m in _CALL_RE.finditer(body)})
+        io_toks  = sorted({m.group(1).upper() for m in _IO_RE.finditer(body)})
+        all_calls.extend(calls)
+        all_io.extend(io_toks)
+        paragraphs.append({
+            "name": name,
+            "performs": performs,
+            "calls": [{"target": c, "dynamic": False} for c in calls],
+            "io_ops": _normalize_io_ops(io_toks),
+        })
+
+    # de-dup rollups
+    all_calls = sorted(set(all_calls))
+    all_io    = sorted(set(all_io))
+    return paragraphs, all_calls, all_io
 
 class ProLeapAdapter:
     """
@@ -134,12 +189,14 @@ class ProLeapAdapter:
     ) -> Dict[str, Any]:
         want_dump = _should_dump(dump_raw)
 
+        # Pre-expand simple COPY lines using source_index-derived dirs
         if copy_paths:
             try:
                 text = _expand_copys(text, relpath, copy_paths)
             except Exception:
                 pass
 
+        # --- Try ProLeap ---
         xml_str, attempts, raw_out = self._run_proleap(text, dialect, relpath)
         if want_dump:
             _dump_json(_dump_path_for(relpath, "proleap", ".attempts.json"), attempts)
@@ -153,11 +210,22 @@ class ProLeapAdapter:
             if ast:
                 if want_dump:
                     ast["_raw_dump_path"] = str(_dump_path_for(relpath, "proleap", ".xml"))
-                # never emit "notes" unless schema allows it
                 ast.pop("notes", None)
+
+                # Enrich edges & divisions from text
+                paragraphs, calls_all, io_all = _edges_from_text(text)
+                ast["paragraphs"] = paragraphs or ast.get("paragraphs") or [{"name": "MAIN", "performs": [], "calls": [], "io_ops": []}]
+                ast["divisions"] = _detect_divisions(text, ast.get("program_id"))
+                # supplement copybooks from text if any missed
+                txt_copy = self._find_copybooks(text)
+                if txt_copy:
+                    ast["copybooks_used"] = sorted({*(ast.get("copybooks_used") or []), *txt_copy})
+                # debug rollups
+                ast["_calls_all"] = calls_all
+                ast["_io_ops_all"] = _normalize_io_ops(io_all)
                 return ast
 
-        # fallback: cb2xml sometimes parses programs too; try it second
+        # --- Fallback: cb2xml (program) ---
         xml_str, attempts, raw_out = self._run_cb2xml(text, dialect, relpath, is_copybook=False)
         if want_dump:
             _dump_json(_dump_path_for(relpath, "cb2xml_prog", ".attempts.json"), attempts)
@@ -172,38 +240,32 @@ class ProLeapAdapter:
                 if want_dump:
                     ast["_raw_dump_path"] = str(_dump_path_for(relpath, "cb2xml_prog", ".xml"))
                 ast.pop("notes", None)
+
+                # Enrich edges & divisions from text
+                paragraphs, calls_all, io_all = _edges_from_text(text)
+                ast["paragraphs"] = paragraphs or ast.get("paragraphs") or [{"name": "MAIN", "performs": [], "calls": [], "io_ops": []}]
+                ast["divisions"] = _detect_divisions(text, ast.get("program_id"))
+                txt_copy = self._find_copybooks(text)
+                if txt_copy:
+                    ast["copybooks_used"] = sorted({*(ast.get("copybooks_used") or []), *txt_copy})
+                ast["_calls_all"] = calls_all
+                ast["_io_ops_all"] = _normalize_io_ops(io_all)
                 return ast
 
-        # final fallback: regex
+        # --- Final fallback: regex-only from text ---
         program_id = self._guess_program_id(text) or self._program_id_from_filename(relpath)
-        paragraphs = self._find_paragraphs(text)
-        performs   = self._find_performs(text)
-        calls      = self._find_calls(text)
-        io_ops_all = self._find_io_ops(text)
+        paragraphs, calls_all, io_all = _edges_from_text(text)
         copybooks  = self._find_copybooks(text)
-
-        para_objs = [
-            {
-                "name": p,
-                "performs": sorted(performs.get(p, [])),
-                "calls": [],
-                # We don't have paragraph-scoped IO today; keep empty array (schema allows []).
-                "io_ops": [],
-            }
-            for p in sorted(set(paragraphs))
-        ] or [{"name": "MAIN", "performs": [], "calls": [], "io_ops": []}]
 
         ast: Dict[str, Any] = {
             "type": "program",
             "program_id": program_id,
-            "divisions": {"identification": {}, "environment": {}, "data": {}, "procedure": {}},
-            "paragraphs": para_objs,
+            "divisions": _detect_divisions(text, program_id),
+            "paragraphs": paragraphs or [{"name": "MAIN", "performs": [], "calls": [], "io_ops": []}],
             "copybooks_used": sorted(copybooks),
-            # rollup fields for debugging/consumers; keep underscore-namespaced
-            "_calls_all": sorted(calls),
-            "_io_ops_all": _normalize_io_ops(sorted(set(io_ops_all))),
+            "_calls_all": calls_all,
+            "_io_ops_all": _normalize_io_ops(io_all),
         }
-        # ensure no stray "notes"
         ast.pop("notes", None)
         return ast
 
@@ -233,7 +295,6 @@ class ProLeapAdapter:
                 res: Dict[str, Any] = {"type": "copybook", "name": name, "items": items}
                 if want_dump:
                     res["_raw_dump_path"] = str(_dump_path_for(relpath, "cb2xml_copy", ".xml"))
-                # never emit "notes"
                 res.pop("notes", None)
                 return res
 
@@ -263,7 +324,7 @@ class ProLeapAdapter:
 
         def _try_stdin(src: str, tag: str) -> Tuple[Optional[str], str]:
             cmd = ["java", "-cp", cp, mains[0], "-stdin"]
-            attempts.append({"mode": "stdin", "cmd": cmd, tag: True})
+            attempts.append({"mode": "stdin", "cmd": cmd, "tag": tag})
             try:
                 out = subprocess.check_output(cmd, input=src.encode("utf-8"),
                                               stderr=subprocess.STDOUT, env=env)
@@ -283,7 +344,7 @@ class ProLeapAdapter:
             try:
                 for args in ([in_path], ["-xml", in_path], ["--xml", in_path]):
                     cmd = ["java", "-cp", cp, mains[0], *args]
-                    attempts.append({"mode": "file", "cmd": cmd, tag: True})
+                    attempts.append({"mode": "file", "cmd": cmd, "tag": tag})
                     try:
                         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env)
                         s = out.decode("utf-8", errors="replace")
@@ -313,8 +374,10 @@ class ProLeapAdapter:
         if s:
             return s, attempts, combined_text_out
 
-        # 2) If we saw IMS markers (or proactively), sanitize and retry once
-        if any(p.search(cobol_src) for p in _EXEC_BLOCKS) or "EXEC DLI" in cobol_src.upper() or "EXEC IMS" in cobol_src.upper() or "EXEC DLI" in combined_text_out.upper() or "EXEC IMS" in combined_text_out.upper():
+        # 2) If IMS markers detected, sanitize and retry once
+        if any(p.search(cobol_src) for p in _EXEC_BLOCKS) or \
+           "EXEC DLI" in cobol_src.upper() or "EXEC IMS" in cobol_src.upper() or \
+           "EXEC DLI" in combined_text_out.upper() or "EXEC IMS" in combined_text_out.upper():
             sanitized = _neutralize_unsupported_execs(cobol_src)
             s, log = _try_stdin(sanitized, "sanitized_exec")
             combined_text_out += log
@@ -404,14 +467,13 @@ class ProLeapAdapter:
         program_id = self._find_xml_text(root, ["program-id", "programId", "PROGRAM-ID"]) \
                      or self._program_id_from_filename(relpath)
 
-        # paragraphs / sections
+        # paragraph names if present
         para_names = set()
         for tag in ("paragraph", "Paragraph", "para", "paragraphName"):
             for node in root.findall(f".//{tag}"):
                 nm = (node.get("name") or (node.text or "")).strip()
                 if nm:
                     para_names.add(nm.upper())
-
         paragraphs = [{"name": p, "performs": [], "calls": [], "io_ops": []}
                       for p in sorted(para_names)] or [{"name": "MAIN", "performs": [], "calls": [], "io_ops": []}]
 
@@ -446,7 +508,6 @@ class ProLeapAdapter:
                 nm = (node.get("name") or (node.text or "")).strip()
                 if nm:
                     para_names.add(nm.upper())
-
         paragraphs = [{"name": p, "performs": [], "calls": [], "io_ops": []}
                       for p in sorted(para_names)] or [{"name": "MAIN", "performs": [], "calls": [], "io_ops": []}]
 
@@ -505,26 +566,8 @@ class ProLeapAdapter:
         m = _PROGRAM_ID_RE.search(text)
         return m.group(1).upper() if m else None
 
-    def _find_paragraphs(self, text: str) -> List[str]:
-        names = [m.group(1).upper() for m in _PARAGRAPH_RE.finditer(text)]
-        seen, ordered = set(), []
-        for n in names:
-            if n not in seen:
-                ordered.append(n); seen.add(n)
-        return ordered
-
-    def _find_performs(self, text: str) -> Dict[str, List[str]]:
-        targets = [m.group(1).upper() for m in _PERFORM_RE.finditer(text)]
-        return {"MAIN": sorted(set(targets))} if targets else {}
-
-    def _find_calls(self, text: str) -> List[str]:
-        return sorted({m.group(1).upper() for m in _CALL_RE.finditer(text)})
-
     def _find_copybooks(self, text: str) -> List[str]:
         return sorted({m.group(1).upper() for m in _COPY_RE.finditer(text)})
-
-    def _find_io_ops(self, text: str) -> List[str]:
-        return sorted({m.group(1).upper() for m in _IO_RE.finditer(text)})
 
     def _find_xml_text(self, root: Optional[ET.Element], candidates: List[str]) -> Optional[str]:
         if root is None:
