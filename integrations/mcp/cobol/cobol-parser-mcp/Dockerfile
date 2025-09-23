@@ -21,19 +21,20 @@ COPY schemas ./schemas
 
 # install python deps / package
 RUN pip install --no-cache-dir \
-      orjson==3.* jsonschema==4.* chardet==5.* pydantic==2.* && \
-    pip install --no-cache-dir .
+      orjson==3.* jsonschema==4.* chardet==5.* pydantic==2.* click==8.* \
+  && pip install --no-cache-dir .
 
-# entrypoint prints readiness to STDOUT then starts the stdio server
+# lightweight entrypoint that just runs the stdio server
+# (no noisy preamble so the host sees the MCP handshake fast)
 RUN printf '%s\n' '#!/usr/bin/env sh' \
                  'set -e' \
-                 'echo "mcp server ready"' \
-                 'exec python -m cobol_parser_mcp --stdio' > /usr/local/bin/entrypoint.sh \
+                 'exec python -m src.main --stdio' > /usr/local/bin/entrypoint.sh \
  && chmod +x /usr/local/bin/entrypoint.sh
 
 ENV CB2XML_CLASSPATH=/opt/cb2xml/lib/* \
     CB2XML_MAIN=net.sf.cb2xml.Cb2Xml \
     PROLEAP_CLASSPATH=/opt/proleap/lib/proleap-cli-bridge.jar \
-    PROLEAP_MAIN=com.renova.proleap.CLI
+    PROLEAP_MAIN=com.renova.proleap.CLI \
+    WORKSPACE_CONTAINER=/workspace
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -1,10 +1,11 @@
+# services/learning-service/app/graphs/nodes/validate_node.py
 from __future__ import annotations
 
 import hashlib
 import orjson
 from typing import Any, Dict, List, Optional
 
-from app.clients.artifact_service import ArtifactServiceClient
+from app.clients.artifact_service import ArtifactServiceClient, ServiceClientError
 from app.db.runs import append_run_artifacts
 from app.models.run import ArtifactEnvelope, ArtifactProvenance
 
@@ -43,14 +44,27 @@ async def validate_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Validates `state['last_output']` using artifact-service, computes identity (or accepts provided),
     wraps into ArtifactEnvelope, and appends to `state['produced']`.
 
-    - Respects options.allow_partial_step_failures (skip bad items vs. fail step).
+    Key behaviors:
+    - Accepts and keeps ANY kinds returned by tools if they exist in the registry.
+    - If a returned kind is unknown to the registry (404/400), we SKIP it (with a warning)
+      when soft-fail is enabled. Soft-fail is enabled when either:
+        * options.allow_partial_step_failures is True, OR
+        * the step param 'allow_missing_kinds' is truthy.
+    - Unknown/invalid kinds will fail the step only when soft-fail is disabled.
     - Caches kind definitions per step to avoid repeated GETs.
     """
-    workspace_id = state["workspace_id"]  # not used here but kept for context
+    # Not used directly here, but we keep for context and future use.
+    workspace_id = state["workspace_id"]
     run_id = state["run_id"]
     idx = int(state.get("_step_index", 0))
     step = state["plan"]["steps"][idx]
-    allow_partial = bool((state.get("options") or {}).get("allow_partial_step_failures", False))
+
+    # Soft-fail knobs
+    allow_partial_global = bool((state.get("options") or {}).get("allow_partial_step_failures", False))
+    step_params = (step.get("params") or {})
+    allow_missing_kinds = bool(step_params.get("allow_missing_kinds"))
+    allow_partial = bool(allow_partial_global or allow_missing_kinds)
+
     correlation_id: Optional[str] = state.get("correlation_id")
 
     produced_by_kind: Dict[str, List[Dict[str, Any]]] = state.get("produced", {})
@@ -65,10 +79,9 @@ async def validate_node(state: Dict[str, Any]) -> Dict[str, Any]:
             if not kind_id:
                 # Skip untyped results
                 if allow_partial:
-                    (state.setdefault("errors", [])).append("validate_node: missing kind_id on output item")
+                    (state.setdefault("warnings", [])).append("validate_node: skipping untyped output item")
                     continue
-                else:
-                    raise ValueError("validate_node: output item missing kind/kind_id")
+                raise ValueError("validate_node: output item missing kind/kind_id")
 
             data = item.get("data") or {}
             version = str(
@@ -77,7 +90,7 @@ async def validate_node(state: Dict[str, Any]) -> Dict[str, Any]:
             )
 
             try:
-                # 1) Schema validation
+                # 1) Schema validation (may raise ServiceClientError if kind/version invalid or data fails schema)
                 await arts.validate_kind_data(
                     kind_id=kind_id, data=data, version=version, correlation_id=correlation_id
                 )
@@ -109,9 +122,16 @@ async def validate_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 envelopes.append(env)
                 produced_by_kind.setdefault(kind_id, []).append(env.model_dump())
 
+            except ServiceClientError as e:
+                # Registry rejected the kind (e.g., unknown kind, unknown version, or schema violation).
+                if allow_partial:
+                    msg = f"validate_node: skipped kind={kind_id} due to registry error (status={e.status})"
+                    (state.setdefault("warnings", [])).append(msg)
+                    continue
+                raise
             except Exception as e:
                 if allow_partial:
-                    (state.setdefault("errors", [])).append(f"validate_node: {kind_id} failed: {e}")
+                    (state.setdefault("warnings", [])).append(f"validate_node: {kind_id} failed: {e}")
                     continue
                 raise
 

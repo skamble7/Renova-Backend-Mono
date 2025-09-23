@@ -13,11 +13,9 @@ from src.utils.discovery import walk_sources, filter_paths
 from src.utils.encoding import detect_encoding
 from src.utils.hashing import sha256_bytes
 from src.utils.validator import SchemaRegistry
-from src.utils.indexer import build_source_index  # NEW
+from src.utils.indexer import build_source_index, derive_copy_paths
 from src.parser.proleap_adapter import ProLeapAdapter
 from src.parser.normalizer import normalize_copybook, normalize_program
-from src.utils.indexer import build_source_index, derive_copy_paths
-
 
 _shutdown = False
 
@@ -49,7 +47,7 @@ def _normalize_root(root: str) -> str:
     if root.startswith(ws_ctr):
         return root
 
-    # Normalize Windows-style paths C:\foo\bar → /c/foo/bar
+    # Normalize Windows-style paths C:\\foo\\bar → /c/foo/bar
     r = root
     if re.match(r"^[A-Za-z]:\\", r):
         drive, rest = r[:2], r[2:]
@@ -79,7 +77,7 @@ def list_tools() -> Dict[str, Any]:
         "tools": [
             {
                 "name": "parse_tree",
-                "description": "Parse COBOL programs and copybooks; normalize to CAM kinds. Also emits cam.asset.source_index.",
+                "description": "Parse COBOL programs and copybooks; normalize to CAM kinds. Also emits cam.asset.source_index. Supports pagination via continuation.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["root"],
@@ -100,6 +98,24 @@ def list_tools() -> Dict[str, Any]:
                         "raw_dump_dir": {
                             "type": "string",
                             "description": "Directory root for raw AST dumps. Defaults to /tmp/proleap_raw (or RAW_AST_DUMP_DIR env)."
+                        },
+                        "start_at": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "default": 0,
+                            "description": "Offset into the target file list (for continuation)."
+                        },
+                        "file_limit": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "default": 0,
+                            "description": "Max files to parse this call (0 = unlimited)."
+                        },
+                        "budget_seconds": {
+                            "type": "number",
+                            "minimum": 0,
+                            "default": 60,
+                            "description": "Soft time budget; the tool returns partial results and a continuation cursor when reached (0 disables)."
                         }
                     },
                     "additionalProperties": False
@@ -121,10 +137,24 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
     debug_raw: bool = bool(inp.get("debug_raw", False))
     raw_dump_dir: str = inp.get("raw_dump_dir") or os.environ.get("RAW_AST_DUMP_DIR") or "/tmp/proleap_raw"
 
+    # Pagination controls
+    start_at: int = int(inp.get("start_at") or 0)
+    file_limit: int = int(inp.get("file_limit") or 0)
+    budget_seconds: float = float(inp.get("budget_seconds") or 60.0)
+
+    # If debug_raw is false, ensure we do not dump raw ASTs even if env is set
+    if not debug_raw and os.environ.get("RAW_AST_DUMP_DIR"):
+        try:
+            os.environ.pop("RAW_AST_DUMP_DIR", None)
+        except Exception:
+            pass
+
     diagnostics: List[Dict[str, Any]] = []
     artifacts: List[Dict[str, Any]] = []
     stats = {
         "files_scanned": 0,
+        "files_total": 0,
+        "start_at": max(0, start_at),
         "programs_emitted": 0,
         "copybooks_emitted": 0,
         "parser_version": "normalizer=1.0.0,adapter=proleap/0.0.2",
@@ -133,41 +163,76 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
 
     if not os.path.isdir(root):
         diagnostics.append({"level": "error", "relpath": "", "message": f"Root not a directory: {root}"})
-        return {"artifacts": [], "diagnostics": diagnostics, "stats": stats}
+        return {
+            "artifacts": [],
+            "diagnostics": diagnostics,
+            "stats": stats,
+            "continuation": {"has_more": False, "next": start_at, "remaining": 0, "total": 0},
+        }
 
     schema_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "schemas"))
     registry = SchemaRegistry(schema_dir)
     adapter = ProLeapAdapter()
 
-    # --- A) Build and emit Source Index (always build; emit as artifact) ---
+    # --- A) Build and emit Source Index ---
     index_data = build_source_index(root)
+
+    # sanitize: drop keys not in v1.0.0 schema
+    # Allowed keys confirmed against artifact-service error: remove format/copybook_dir flags etc.
+    allowed = {"relpath", "size_bytes", "sha256", "kind", "language_hint", "encoding", "program_id_guess"}
+    for f in index_data.get("files", []) or []:
+        for k in list(f.keys()):
+            if k not in allowed:
+                f.pop(k, None)
 
     copy_dirs_rel = derive_copy_paths(index_data)
     copy_dirs_abs = [os.path.join(root, d) for d in copy_dirs_rel]
 
-    idx_artifact = {"kind": "cam.asset.source_index", "version": "1.0.0", "data": index_data}
-    idx_errors = registry.validate(idx_artifact)
-    if idx_errors:
-        diagnostics.append({"level": "warning", "relpath": "", "message": f"Index schema: {idx_errors[:3]}{'...' if len(idx_errors)>3 else ''}"})
-    else:
+    idx_artifact = {"kind": "cam.asset.source_index", "version": "1.0.0", "body": index_data}
+    if not registry.validate(idx_artifact):
         artifacts.append(idx_artifact)
 
     # --- B) Choose parse targets ---
     if use_source_index:
-        # Respect allow_paths if supplied
         files = index_data.get("files", [])
         if allow_paths:
             allow_set = {p.strip().lstrip("./") for p in allow_paths if p.strip()}
             files = [f for f in files if f.get("relpath") in allow_set]
-        targets = [(os.path.join(root, f["relpath"]), f["relpath"], f["kind"])
-                   for f in files if f.get("kind") in {"cobol", "copybook"}]
+        files = [f for f in files if f.get("kind") in {"cobol", "copybook"}]
+        files.sort(key=lambda f: (f.get("kind") or "", f.get("relpath") or ""))
+        targets_all: List[Tuple[str, str, str]] = [
+            (os.path.join(root, f["relpath"]), f["relpath"], f["kind"]) for f in files
+        ]
     else:
-        # Legacy discovery based on extensions
-        targets = list(filter_paths(walk_sources(root), allow_paths))
+        targets_all = list(filter_paths(walk_sources(root), allow_paths))
 
-    # --- C) Parse files ---
-    for abs_p, rel_p, kind in targets:
+    total = len(targets_all)
+    stats["files_total"] = total
+
+    if start_at >= total:
+        return {
+            "artifacts": artifacts,
+            "diagnostics": diagnostics,
+            "stats": stats,
+            "continuation": {"has_more": False, "next": start_at, "remaining": 0, "total": total},
+        }
+
+    t0 = time.monotonic()
+    processed = 0
+    emitted_programs = 0
+    emitted_copybooks = 0
+
+    remaining_slice = targets_all[start_at:]
+    if file_limit > 0:
+        remaining_slice = remaining_slice[:file_limit]
+
+    for abs_p, rel_p, kind in remaining_slice:
+        if _shutdown or (budget_seconds and (time.monotonic() - t0) >= budget_seconds):
+            break
+
         stats["files_scanned"] += 1
+        processed += 1
+
         try:
             with open(abs_p, "rb") as f:
                 raw = f.read()
@@ -185,67 +250,52 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
         content_hash = sha256_bytes(payload)
 
         if kind == "cobol":
-            ast = adapter.parse_program(
-                text=text,
-                relpath=rel_p,
-                dialect=dialect,
-                dump_raw=debug_raw,
-                dump_dir=raw_dump_dir,
-                copy_paths=copy_dirs_abs
-            )
+            ast = adapter.parse_program(text, rel_p, dialect, debug_raw, raw_dump_dir, copy_dirs_abs)
             data = normalize_program(ast, relpath=rel_p, sha256=content_hash)
-            dump_note = ast.get("_raw_dump_path")
-            if dump_note:
-                (data.setdefault("notes", [])).append({"kind": "raw-ast", "tool": "proleap/cb2xml", "path": dump_note})
-
-            artifact = {"kind": "cam.cobol.program", "version": "1.0.0", "data": data}
-            errors = registry.validate(artifact)
-            if errors:
-                diagnostics.append({
-                    "level": "warning",
-                    "relpath": rel_p,
-                    "message": f"Schema: {errors[:3]}{'...' if len(errors)>3 else ''}"
-                })
-            else:
-                stats["programs_emitted"] += 1
+            artifact = {"kind": "cam.cobol.program", "version": "1.0.0", "body": data}
+            if not registry.validate(artifact):
+                emitted_programs += 1
                 artifacts.append(artifact)
 
         elif kind == "copybook":
-            ast = adapter.parse_copybook(
-                text=text,
-                relpath=rel_p,
-                dialect=dialect,
-                dump_raw=debug_raw,
-                dump_dir=raw_dump_dir
-            )
+            ast = adapter.parse_copybook(text, rel_p, dialect, debug_raw, raw_dump_dir)
             data = normalize_copybook(ast, relpath=rel_p, sha256=content_hash)
-            dump_note = ast.get("_raw_dump_path")
-            if dump_note:
-                (data.setdefault("notes", [])).append({"kind": "raw-ast", "tool": "cb2xml", "path": dump_note})
-
-            artifact = {"kind": "cam.cobol.copybook", "version": "1.0.0", "data": data}
-            errors = registry.validate(artifact)
-            if errors:
-                diagnostics.append({
-                    "level": "warning",
-                    "relpath": rel_p,
-                    "message": f"Schema: {errors[:3]}{'...' if len(errors)>3 else ''}"
-                })
-            else:
-                stats["copybooks_emitted"] += 1
+            artifact = {"kind": "cam.cobol.copybook", "version": "1.0.0", "body": data}
+            if not registry.validate(artifact):
+                emitted_copybooks += 1
                 artifacts.append(artifact)
 
+    stats["programs_emitted"] = emitted_programs
+    stats["copybooks_emitted"] = emitted_copybooks
+
+    next_offset = start_at + processed
+    continuation = {
+        "has_more": next_offset < total,
+        "next": next_offset,
+        "remaining": max(0, total - next_offset),
+        "total": total,
+    }
+
     def _sort_key(a: Dict[str, Any]) -> Tuple[str, str, str]:
-        data = a.get("data", {})
-        rel = (data.get("source") or {}).get("relpath", "")
-        name = data.get("program_id") or data.get("name") or ""
+        body = a.get("body", {}) or {}
+        rel = (body.get("source") or {}).get("relpath", "")
+        name = body.get("program_id") or body.get("name") or ""
         return (a.get("kind", ""), rel, name)
 
     artifacts.sort(key=_sort_key)
-    return {"artifacts": artifacts, "diagnostics": diagnostics, "stats": stats}
+
+    # Return the *full* result to callers (useful if someone wants stats/diags),
+    # but keep the MCP envelope small by only placing artifacts under structuredContent.
+    return {
+        "artifacts": artifacts,
+        "diagnostics": diagnostics,
+        "stats": stats,
+        "continuation": continuation,
+    }
 
 # ------------------------------ Protocol --------------------------------
 def _send(obj: Dict[str, Any]) -> None:
+    # IMPORTANT: stdout is *only* for JSON-RPC
     sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
@@ -255,8 +305,8 @@ def _send_error(id_val: Any, code: int, message: str, data: Dict[str, Any] | Non
 def _handle_initialize(msg: Dict[str, Any]) -> None:
     result = {
         "protocolVersion": "0.1",
-        "serverInfo": {"name": "mcp.cobol.parser", "version": "0.0.1"},
-        "capabilities": {"tools": {}}
+        "serverInfo": {"name": "mcp.cobol.parser", "version": "0.0.2"},
+        "capabilities": {"tools": {}},
     }
     _send({"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
 
@@ -279,30 +329,37 @@ def _handle_tools_call(msg: Dict[str, Any]) -> None:
         return
 
     try:
-        res = parse_tree(arguments)
+        res = parse_tree(arguments)  # {artifacts, diagnostics, stats, continuation}
+
+        # tiny human summary only (keeps stdout small & safe)
         st = res.get("stats", {})
-        diags = res.get("diagnostics", [])
-        dump_dir = st.get("raw_dump_dir") or ""
-        extra = f" Raw ASTs in: {dump_dir}" if dump_dir else ""
+        cont = res.get("continuation", {})
         summary = (
-            f"COBOL parse complete. Scanned={st.get('files_scanned', 0)}, "
-            f"programs={st.get('programs_emitted', 0)}, "
-            f"copybooks={st.get('copybooks_emitted', 0)}, "
-            f"diagnostics={len(diags)}.{extra}"
+            f"COBOL parse {'partial' if cont.get('has_more') else 'complete'}."
+            f" scanned={st.get('files_scanned', 0)} start_at={st.get('start_at', 0)}"
+            f" programs={st.get('programs_emitted', 0)} copybooks={st.get('copybooks_emitted', 0)}"
+            f" diags={len(res.get('diagnostics') or [])}."
         )
+
+        # IMPORTANT: mirror working git MCP: artifacts reside in structuredContent.artifacts
+        payload = {"artifacts": res.get("artifacts", [])}
+
         _send({
             "jsonrpc": "2.0",
             "id": msg.get("id"),
             "result": {
                 "content": [{"type": "text", "text": summary}],
-                "structuredContent": res
-            }
+                "structuredContent": payload,
+                "isError": False,
+            },
         })
+
     except Exception as e:
+        # Errors still go via result with isError=True (per your client expectations)
         _send({
             "jsonrpc": "2.0",
             "id": msg.get("id"),
-            "result": {"content": [{"type": "text", "text": str(e)}], "isError": True}
+            "result": {"content": [{"type": "text", "text": str(e)}], "isError": True},
         })
 
 def run_stdio_loop() -> None:
@@ -311,14 +368,11 @@ def run_stdio_loop() -> None:
         if not line:
             time.sleep(0.01)
             continue
-        line = line.strip()
-        if not line:
-            continue
         try:
-            msg = json.loads(line)
+            msg = json.loads(line.strip())
         except json.JSONDecodeError:
+            # ignore non-JSON garbage on stdin
             continue
-
         method = msg.get("method")
         if method == "initialize":
             _handle_initialize(msg)
@@ -335,7 +389,6 @@ def run_stdio_loop() -> None:
         else:
             _send_error(msg.get("id"), -32601, f"Unknown method: {method}")
 
-# -------------------------------- Main ---------------------------------
 def main(argv: List[str] | None = None) -> int:
     ap = argparse.ArgumentParser("cobol-parser-mcp")
     ap.add_argument("--stdio", action="store_true")

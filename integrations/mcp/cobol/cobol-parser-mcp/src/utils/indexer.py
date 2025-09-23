@@ -1,4 +1,3 @@
-# integrations/mcp/cobol/cobol-parser-mcp/src/utils/indexer.py
 from __future__ import annotations
 
 import os
@@ -14,6 +13,18 @@ JCL_EXT = {".jcl"}
 DDL_EXT = {".ddl", ".sql"}
 BMS_EXT = {".bms", ".map"}
 
+# Default directories to skip (can override via INDEX_SKIP_DIRS env)
+DEFAULT_SKIP_DIRS = {
+    ".git", ".hg", ".svn",
+    "node_modules", ".pnpm-store", "vendor",
+    "build", "dist", "target", "out", "bin", "obj",
+    ".idea", ".vscode", ".venv", "venv", "__pycache__",
+    ".pytest_cache", "coverage",
+}
+
+# Only include these kinds in the source_index (keeps the index small & relevant)
+INCLUDED_KINDS = {"cobol", "copybook", "jcl", "ddl", "bms"}
+
 def _classify_kind(p: Path, first_k_lines: List[str]) -> str:
     ext = p.suffix.lower()
     if ext in COBOL_EXT:
@@ -27,7 +38,7 @@ def _classify_kind(p: Path, first_k_lines: List[str]) -> str:
     if ext in BMS_EXT:
         return "bms"
 
-    # token-level hints (very light)
+    # Very light token hinting (kept for robustness, but we don't index "other")
     upper = "\n".join(first_k_lines[:200]).upper()
     if "IDENTIFICATION DIVISION." in upper or "ENVIRONMENT DIVISION." in upper:
         return "cobol"
@@ -40,7 +51,6 @@ def _copybook_dir_hint(p: Path) -> bool:
     return any(seg in parts for seg in {"cpy", "copy", "copylib", "copybooks", "includes"})
 
 def _format_hint(first_k_lines: List[str]) -> str:
-    # crude heuristic: if many lines begin before col 8 or lines are very long → FREE
     if not first_k_lines:
         return "FIXED"
     early = sum(1 for ln in first_k_lines[:200] if ln[:7].strip() != "")
@@ -48,21 +58,6 @@ def _format_hint(first_k_lines: List[str]) -> str:
     if early > 10 or very_long > 10:
         return "FREE"
     return "FIXED"
-
-def _sha256_file(path: Path) -> str:
-    # stream to avoid loading entire file
-    h_chunks: List[bytes] = []
-    # We already have sha256_bytes; reuse it on concatenated chunks for simplicity here
-    # (still streaming reads; memory bounded)
-    import hashlib
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while True:
-            b = f.read(1024 * 64)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
 
 def _read_head(path: Path, max_bytes: int = 4096) -> bytes:
     try:
@@ -79,26 +74,43 @@ def _first_lines(sample: bytes) -> List[str]:
     return txt.splitlines()
 
 def build_source_index(root: str) -> Dict[str, object]:
+    """
+    Build a compact source index focusing on COBOL-related inputs.
+    Skips heavy, irrelevant directories by default (override with INDEX_SKIP_DIRS).
+    """
     root_p = Path(root)
-    files = []
+    files: List[Dict[str, object]] = []
 
-    for dirpath, _, filenames in os.walk(root):
+    # Resolve skip dirs from env (comma-separated)
+    skip_env = os.environ.get("INDEX_SKIP_DIRS", "")
+    skip_dirs = {d.strip() for d in skip_env.split(",") if d.strip()} or DEFAULT_SKIP_DIRS
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        # prune directories in-place for os.walk efficiency
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+
         for fn in filenames:
             abs_p = Path(dirpath) / fn
             if not abs_p.is_file():
                 continue
+
             rel_p = abs_p.relative_to(root_p)
             sample = _read_head(abs_p, 4096)
             lines = _first_lines(sample)
             kind = _classify_kind(abs_p, lines)
+
+            # Only index the kinds we care about (keeps payload small/fast)
+            if kind not in INCLUDED_KINDS:
+                continue
+
+            # Stream sha256 for the files we actually index
             sha = _sha256_file(abs_p)
-            meta = {
+            meta: Dict[str, object] = {
                 "relpath": str(rel_p).replace("\\", "/"),
                 "size_bytes": abs_p.stat().st_size,
                 "sha256": sha,
                 "kind": kind,
             }
-            # Optional hints only when relevant
             if kind in {"cobol", "copybook"}:
                 meta["language_hint"] = "COBOL"
                 meta["format_hint"] = _format_hint(lines)
@@ -108,13 +120,22 @@ def build_source_index(root: str) -> Dict[str, object]:
     files.sort(key=lambda f: f["relpath"])  # deterministic order
     return {"root": str(root_p), "files": files}
 
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 64), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 def derive_copy_paths(index: Dict[str, object]) -> list[str]:
     """Pick candidate directories to search for copybooks (relative to root)."""
     files = index.get("files", [])
     parents = set()
     for f in files:
         if f.get("kind") == "copybook" or f.get("copybook_dir_hint"):
-            rel = Path(f["relpath"]).parent
+            from pathlib import Path as _P
+            rel = _P(f["relpath"]).parent
             parents.add(str(rel).replace("\\", "/"))
     # shortest path first, cap to a sane number
     return sorted(parents, key=lambda s: (len(s), s))[:20]

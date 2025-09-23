@@ -71,7 +71,7 @@ async def seed_integrations() -> None:
                     "run",
                     "--rm",
                     "-i",
-                    "--volumes-from", "renova-learning-service",  # <-- inherit /workspace bind
+                    "--volumes-from", "renova-learning-service",  # inherit /workspace bind
                     "-w", "/opt/renova/tools/git",
                     "-e", "LOG_LEVEL=info",
                     "-e", "REPO_WORK_ROOT=/workspace/.renova/src",
@@ -81,11 +81,11 @@ async def seed_integrations() -> None:
                     "git-mcp:dev",
                     "--stdio",
                 ],
-                cwd=None,                 # no need; all paths are absolute in the child
+                cwd=None,
                 env={},
                 env_aliases={},
                 restart_on_exit=True,
-                readiness_regex=None,     # server doesn't print a ready banner; don't wait
+                readiness_regex=None,
                 kill_timeout_sec=10,
             ),
         ),
@@ -103,7 +103,7 @@ async def seed_integrations() -> None:
                     "run",
                     "--rm",
                     "-i",
-                    "--volumes-from", "renova-learning-service",  # <-- inherit /workspace bind
+                    "--volumes-from", "renova-learning-service",  # inherit /workspace bind
                     "-w", "/opt/renova/tools/cobol-parser",
                     "-e", "LOG_LEVEL=info",
                     "-e", "COBOL_DIALECT=COBOL85",
@@ -121,7 +121,7 @@ async def seed_integrations() -> None:
                 env={},
                 env_aliases={},
                 restart_on_exit=True,
-                readiness_regex=None,     # avoid readiness wait unless the server prints it
+                readiness_regex=None,
                 kill_timeout_sec=10,
             ),
         ),

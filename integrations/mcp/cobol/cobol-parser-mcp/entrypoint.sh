@@ -2,13 +2,10 @@
 set -Eeuo pipefail
 
 >&2 echo "[cobol-parser-mcp] starting (LOG_LEVEL=${LOG_LEVEL:-info}, DIALECT=${COBOL_DIALECT:-COBOL85})"
-if [[ ! -f "${PROLEAP_JAR:-/opt/proleap/cb2xml.jar}" ]]; then
-  >&2 echo "[cobol-parser-mcp] WARNING: PROLEAP_JAR not found at '${PROLEAP_JAR:-/opt/proleap/cb2xml.jar}'."
-  >&2 echo "[cobol-parser-mcp]          You can mount or bake it into the image if you use the ProLeap adapter."
-fi
 
-export PYTHONUNBUFFERED=1
-export PYTHONPATH="/opt/renova/tools/cobol-parser:${PYTHONPATH:-}"
+# Helpful environment echo for debugging volumes / paths
+>&2 echo "[cobol-parser-mcp] WORKSPACE_HOST=${WORKSPACE_HOST:-} WORKSPACE_CONTAINER=${WORKSPACE_CONTAINER:-}"
+>&2 echo "[cobol-parser-mcp] CB2XML_CLASSPATH=${CB2XML_CLASSPATH:-} PROLEAP_CLASSPATH=${PROLEAP_CLASSPATH:-}"
 
-# pass through args (e.g. --stdio)
-exec python -m src.main "$@"
+# Print a readiness line (your transport doesn’t require it, but it helps ops)
+>&2 echo "mcp server ready"

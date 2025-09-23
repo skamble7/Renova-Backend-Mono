@@ -10,62 +10,45 @@ log = logging.getLogger("app.seeds.packs")
 
 
 async def _delete_pack_if_exists(svc: PackService, key: str, version: str) -> None:
-    """
-    Best-effort delete for an existing pack identified by key+version.
-    Works with common method names and guards for environments where delete
-    may not be available.
-    """
     try:
         existing = await svc.get_by_key_version(key, version)
     except Exception:
         existing = None
-
     if not existing:
         return
-
-    # Try typical delete signatures
     for meth_name in ("delete", "remove", "archive"):
         m = getattr(svc, meth_name, None)
         if callable(m):
             try:
-                # Some services accept "key@version", others accept an id, others accept key+version args.
                 try:
-                    await m(f"{key}@{version}", actor="seed")  # e.g., delete("key@version")
+                    await m(f"{key}@{version}", actor="seed")
                     log.info("[capability.seeds.packs] %s('%s@%s') ok", meth_name, key, version)
                     return
                 except TypeError:
                     try:
-                        await m(existing.id, actor="seed")  # e.g., delete(doc_id)
+                        await m(existing.id, actor="seed")
                         log.info("[capability.seeds.packs] %s(id=%s) ok", meth_name, existing.id)
                         return
                     except TypeError:
-                        await m(key, version, actor="seed")  # e.g., delete(key, version)
+                        await m(key, version, actor="seed")
                         log.info("[capability.seeds.packs] %s('%s','%s') ok", meth_name, key, version)
                         return
             except Exception as e:
                 log.warning("[capability.seeds.packs] %s failed: %s", meth_name, e)
-
     log.warning("[capability.seeds.packs] Could not delete existing pack %s@%s; continuing with create()", key, version)
 
 
 async def _create_refresh_publish(svc: PackService, payload: CapabilityPackCreate, publish_on_seed: bool) -> None:
-    """
-    Helper to create, refresh snapshots, and optionally publish a pack.
-    Assumes the caller has already cleaned up any existing same-version pack if desired.
-    """
     key = payload.key
     version = payload.version
-
     created = await svc.create(payload, actor="seed")
     log.info("[capability.seeds.packs] created: %s@%s (id=%s)", key, version, getattr(created, "id", None))
-
     refreshed = await svc.refresh_snapshots(f"{key}@{version}")
     if refreshed:
         log.info("[capability.seeds.packs] snapshots refreshed: %s", refreshed.id)
     else:
         log.warning("[capability.seeds.packs] pack not found for snapshot refresh: %s@%s", key, version)
         return
-
     if publish_on_seed:
         published = await svc.publish(f"{key}@{version}", actor="seed")
         if published:
@@ -77,21 +60,16 @@ async def _create_refresh_publish(svc: PackService, payload: CapabilityPackCreat
 
 
 async def seed_packs() -> None:
-    """
-    Seed TWO capability packs under the same key 'cobol-mainframe':
-      1) v1.0.1 (existing full-flow pack) — same flow, but clone step no longer forces an absolute dest.
-      2) v1.0.2 (new minimal pack) — two-step playbook: cap.repo.clone -> cap.cobol.parse.
-
-    If PACK_SEED_PUBLISH=1, both will be published after snapshot refresh.
-    """
     log.info("[capability.seeds.packs] Begin")
 
     publish_on_seed = os.getenv("PACK_SEED_PUBLISH", "1") in ("1", "true", "True")
     svc = PackService()
 
     pack_key = "cobol-mainframe"
-    full_version = "v1.0.1"   # existing full pack (dest removed in clone)
-    mini_version = "v1.0.2"   # new derived minimal pack
+    full_version = "v1.0.1"
+    mini_version = "v1.0.2"
+
+    LONG_TIMEOUT = 3600  # seconds
 
     # -------------------------------
     # Pack #1: Full-flow v1.0.1
@@ -108,20 +86,54 @@ async def seed_packs() -> None:
                 name="Clone Repo",
                 capability_id="cap.repo.clone",
                 description="Clone source repository; records commit and paths_root.",
-                # Let git-mcp choose a safe relative folder under its REPO_WORK_ROOT.
-                # If callers want to control it, they can supply repo.dest externally (relative).
+                execution_mode="mcp",
                 params={
                     "url": "${git.url}",
                     "branch": "${git.branch:-main}",
                     "depth": 0,
                 },
+                tool_calls=[
+                    {
+                        "tool": "clone_repo",
+                        "args": {
+                            "url": "${git.url}",
+                            "branch": "${git.branch:-main}",
+                            "depth": 0,
+                        },
+                        "timeout_sec": LONG_TIMEOUT,
+                        "retries": 1,
+                    }
+                ],
             ),
             PlaybookStep(
                 id="s2.cobol",
                 name="Parse COBOL",
                 capability_id="cap.cobol.parse",
                 description="ProLeap/cb2xml parse of programs and copybooks into normalized CAM kinds.",
-                params={"root": "${repo.paths_root}", "paths": [], "dialect": "COBOL85"},
+                execution_mode="mcp",
+                # ⬇️ add file_limit & budget_seconds; keep COBOL85
+                params={
+                    "root": "${repo.paths_root}",
+                    "paths": [],
+                    "dialect": "COBOL85",
+                    "file_limit": 24,
+                    "budget_seconds": 20
+                },
+                tool_calls=[
+                    {
+                        "tool": "parse_tree",
+                        # ⬇️ mirror the same args into the tool call
+                        "args": {
+                            "root": "${repo.paths_root}",
+                            "paths": [],
+                            "dialect": "COBOL85",
+                            "file_limit": 24,
+                            "budget_seconds": 20
+                        },
+                        "timeout_sec": LONG_TIMEOUT,
+                        "retries": 1,
+                    }
+                ],
             ),
             PlaybookStep(
                 id="s3.jcl",
@@ -213,7 +225,7 @@ async def seed_packs() -> None:
     await _create_refresh_publish(svc, payload_full, publish_on_seed)
 
     # -------------------------------
-    # Pack #2: Minimal two-step v1.0.2 (NEW)
+    # Pack #2: Minimal two-step v1.0.2
     # -------------------------------
     await _delete_pack_if_exists(svc, pack_key, mini_version)
 
@@ -227,19 +239,53 @@ async def seed_packs() -> None:
                 name="Clone Repo",
                 capability_id="cap.repo.clone",
                 description="Clone source repository; records commit and paths_root.",
-                # No absolute dest; git-mcp will derive a relative folder under REPO_WORK_ROOT.
+                execution_mode="mcp",
                 params={
                     "url": "${git.url}",
                     "branch": "${git.branch:-main}",
                     "depth": 0,
                 },
+                tool_calls=[
+                    {
+                        "tool": "clone_repo",
+                        "args": {
+                            "url": "${git.url}",
+                            "branch": "${git.branch:-main}",
+                            "depth": 0,
+                        },
+                        "timeout_sec": LONG_TIMEOUT,
+                        "retries": 1,
+                    }
+                ],
             ),
             PlaybookStep(
                 id="s2.cobol",
                 name="Parse COBOL",
                 capability_id="cap.cobol.parse",
                 description="ProLeap/cb2xml parse of programs and copybooks into normalized CAM kinds.",
-                params={"root": "${repo.paths_root}", "paths": [], "dialect": "COBOL85"},
+                execution_mode="mcp",
+                # ⬇️ add paging args here too
+                params={
+                    "root": "${repo.paths_root}",
+                    "paths": [],
+                    "dialect": "COBOL85",
+                    "file_limit": 24,
+                    "budget_seconds": 20
+                },
+                tool_calls=[
+                    {
+                        "tool": "parse_tree",
+                        "args": {
+                            "root": "${repo.paths_root}",
+                            "paths": [],
+                            "dialect": "COBOL85",
+                            "file_limit": 24,
+                            "budget_seconds": 20
+                        },
+                        "timeout_sec": LONG_TIMEOUT,
+                        "retries": 1,
+                    }
+                ],
             ),
         ],
     )
@@ -248,7 +294,7 @@ async def seed_packs() -> None:
         key=pack_key,
         version=mini_version,
         title="COBOL Mainframe Modernization (Core)",
-        description="Derived minimal pack with a two-step playbook: clone repo then parse COBOL.",
+        description="Derived minimal pack with a two-step playbook: clone a repo then parse COBOL.",
         capability_ids=[
             "cap.repo.clone",
             "cap.cobol.parse",

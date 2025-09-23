@@ -26,10 +26,25 @@ class SchemaRegistry:
             self._validators[kind] = Draft202012Validator(schema)
 
     def validate(self, artifact: Dict[str, Any]) -> list[str]:
+        """
+        Validate the artifact payload against the kind's schema.
+
+        Accept both envelopes for compatibility:
+        - Preferred: artifact["body"]
+        - Legacy:    artifact["data"]
+        """
         kind = artifact.get("kind")
-        schema = self._validators.get(kind)
-        if not schema:
-            # If schema is missing, we do not fail; we just report a warning upstream.
+        validator = self._validators.get(kind)
+        if not validator:
+            # No schema registered → treat as valid (no blocking).
             return []
-        errors = [e.message for e in schema.iter_errors(artifact.get("data"))]
-        return errors
+
+        payload = artifact.get("body")
+        if payload is None:
+            payload = artifact.get("data")
+
+        if payload is None:
+            # If there's truly no payload, surface a single, clear error.
+            return ["artifact has neither 'body' nor 'data' payload"]
+
+        return [e.message for e in validator.iter_errors(payload)]

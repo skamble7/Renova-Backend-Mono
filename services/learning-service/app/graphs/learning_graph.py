@@ -1,3 +1,4 @@
+# services/learning-service/app/graphs/learning_graph.py
 from __future__ import annotations
 
 from datetime import datetime
@@ -15,6 +16,7 @@ from app.graphs.nodes.validate_node import validate_node
 from app.graphs.nodes.diff_node import diff_node
 from app.graphs.nodes.audit_node import audit_node
 from app.graphs.nodes.finalize_node import finalize_node
+from app.graphs.nodes.gate_produced_node import gate_produced_node
 
 from app.agents.registry import build_step_plan
 from app.clients.capability_service import CapabilityServiceClient
@@ -35,6 +37,7 @@ def build_graph(initial_state: Dict[str, Any]):
     graph.add_node("diff", diff_node)
     graph.add_node("audit", audit_node)
     graph.add_node("finalize", finalize_node)
+    # ❌ DO NOT reference gate_name here (it’s created per-step inside the loop)
 
     steps = (initial_state.get("plan") or {}).get("steps") or []
     n = len(steps)
@@ -63,12 +66,14 @@ def build_graph(initial_state: Dict[str, Any]):
         exec_llm_name = f"{skey}.exec.llm"
         exec_mcp_name = f"{skey}.exec.mcp"
         validate_name = f"{skey}.validate"
+        gate_name = f"{skey}.gate"
 
         graph.add_node(set_idx_name, make_set_index_node(i))
         graph.add_node(ctx_name, prepare_context_node)
         graph.add_node(exec_llm_name, exec_llm_node)
         graph.add_node(exec_mcp_name, exec_mcp_node)
         graph.add_node(validate_name, validate_node)
+        graph.add_node(gate_name, gate_produced_node)
 
         graph.add_edge(prev_tail, set_idx_name)
         graph.add_edge(set_idx_name, ctx_name)
@@ -89,8 +94,9 @@ def build_graph(initial_state: Dict[str, Any]):
 
         graph.add_edge(exec_mcp_name, validate_name)
         graph.add_edge(exec_llm_name, validate_name)
+        graph.add_edge(validate_name, gate_name)
 
-        prev_tail = validate_name
+        prev_tail = gate_name
 
     graph.add_edge(prev_tail, "diff")
     graph.add_edge("diff", "audit")

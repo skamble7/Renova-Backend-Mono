@@ -1,3 +1,4 @@
+# services/learning-service/app/graphs/nodes/exec_mcp_node.py
 from __future__ import annotations
 
 import json
@@ -11,7 +12,6 @@ from app.integrations import IntegrationInvoker
 from app.clients.capability_service import CapabilityServiceClient
 
 logger = logging.getLogger("app.exec.mcp")
-
 
 # Optional: persist per-tool audit entries
 try:
@@ -64,10 +64,6 @@ def _interpolate(value: Any, vars_map: Dict[str, Any]) -> Any:
 
 
 def _inject_context_vars(vars_map: Dict[str, Any], context: Dict[str, Any]) -> None:
-    """
-    Populate handy ${repo.*} vars from any repo snapshot entries we’ve stashed in context.
-    Accept payloads under either 'data' or 'body'.
-    """
     if not isinstance(context, dict):
         return
     snaps = context.get("cam.asset.repo_snapshot") or []
@@ -85,60 +81,159 @@ def _inject_context_vars(vars_map: Dict[str, Any], context: Dict[str, Any]) -> N
                 vars_map.setdefault("repo.dest", payload["dest"])
 
 
+def _maybe_unwrap_result(obj: Any) -> Any:
+    if isinstance(obj, dict) and "result" in obj and isinstance(obj["result"], (dict, list)):
+        return obj["result"]
+    return obj
+
+
+def _collect_top_keys(obj: Any) -> List[str]:
+    if isinstance(obj, dict):
+        return list(obj.keys())[:20]
+    return ["<non-dict>"]
+
+
+def _parse_maybe_json_string(s: Any) -> Any:
+    if isinstance(s, str):
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
+    return None
+
+
+def _extract_artifacts_from_container(container: Any, out: List[Dict[str, Any]]) -> None:
+    """
+    Pull artifacts from a single container object (dict).
+    Supported shapes inside 'container':
+      - container["structuredContent"]["artifacts"]
+      - container["structuredContent"]["body"]["artifacts"]
+      - container["structured_content"]["artifacts"]  (snake_case)
+      - container["artifacts"]
+      - container["items"] / ["outputs"] / ["records"] / ["documents"] (each element may be an artifact)
+      - container is actually {"artifacts":[...]} or {"body":{"artifacts":[...]}}
+      - container["content"] entries:
+            {type:"text", text:"<json>"} OR {type:"json", json:<obj>} OR a raw JSON string
+    """
+    if not isinstance(container, dict):
+        return
+
+    # canonical and snake_case
+    sc = container.get("structuredContent") or container.get("structured_content")
+    if isinstance(sc, dict):
+        ra = sc.get("artifacts")
+        if isinstance(ra, list):
+            out.extend([a for a in ra if isinstance(a, dict)])
+        body = sc.get("body")
+        if isinstance(body, dict) and isinstance(body.get("artifacts"), list):
+            out.extend([a for a in body["artifacts"] if isinstance(a, dict)])
+
+    # direct artifacts on container
+    ra2 = container.get("artifacts")
+    if isinstance(ra2, list):
+        out.extend([a for a in ra2 if isinstance(a, dict)])
+
+    # items-like holders frequently used by tools
+    for k in ("items", "outputs", "records", "documents"):
+        seq = container.get(k)
+        if isinstance(seq, list):
+            out.extend([a for a in seq if isinstance(a, dict)])
+
+    # container may itself be {"body":{"artifacts":[...]}}
+    if isinstance(container.get("body"), dict) and isinstance(container["body"].get("artifacts"), list):
+        out.extend([a for a in container["body"]["artifacts"] if isinstance(a, dict)])
+
+    # content: text/json
+    content = container.get("content")
+    if isinstance(content, list):
+        for c in content:
+            if not isinstance(c, dict):
+                # Raw string content, try parse
+                parsed = _parse_maybe_json_string(c)
+                if isinstance(parsed, dict):
+                    _extract_artifacts_from_container(parsed, out)
+                elif isinstance(parsed, list):
+                    for el in parsed:
+                        if isinstance(el, dict):
+                            _extract_artifacts_from_container(el, out)
+                continue
+
+            ctype = (c.get("type") or "").lower()
+            if ctype == "text" and isinstance(c.get("text"), str):
+                parsed = _parse_maybe_json_string(c["text"])
+                if isinstance(parsed, dict):
+                    _extract_artifacts_from_container(_maybe_unwrap_result(parsed), out)
+                elif isinstance(parsed, list):
+                    for el in parsed:
+                        if isinstance(el, dict):
+                            _extract_artifacts_from_container(el, out)
+            elif ctype == "json":
+                payload = c.get("json")
+                if isinstance(payload, (dict, list)):
+                    payload = _maybe_unwrap_result(payload)
+                    if isinstance(payload, dict):
+                        _extract_artifacts_from_container(payload, out)
+                    elif isinstance(payload, list):
+                        for el in payload:
+                            if isinstance(el, dict):
+                                _extract_artifacts_from_container(el, out)
+
+
 def _extract_artifacts(result: Any) -> List[Dict[str, Any]]:
     """
-    Find artifact envelopes in common MCP shapes:
-      - result["structuredContent"]["artifacts"]
-      - result["artifacts"]
-      - JSON string inside result["content"][...]["text"] with {"artifacts":[...]}
-    Returns the *raw* artifact dicts (no key normalization yet).
+    Collect artifact dicts from many MCP result shapes.
+    Also supports:
+      - top-level list of artifact-like dicts
+      - {"result":[...]} wrapping
     """
     arts: List[Dict[str, Any]] = []
 
+    # unwrap one layer of {"result": ...} if present
+    result = _maybe_unwrap_result(result)
+
+    # top-level list
+    if isinstance(result, list):
+        for el in result:
+            if isinstance(el, dict):
+                # Either an artifact object or a container of artifacts
+                # Quick check: if it looks like an artifact, collect directly.
+                if any(k in el for k in ("kind", "kind_id", "kindId")):
+                    arts.append(el)
+                else:
+                    _extract_artifacts_from_container(el, arts)
+        return arts
+
+    # dict container
     if isinstance(result, dict):
-        sc = result.get("structuredContent")
-        if isinstance(sc, dict):
-            ra = sc.get("artifacts")
-            if isinstance(ra, list):
-                arts.extend([a for a in ra if isinstance(a, dict)])
-
-        ra2 = result.get("artifacts")
-        if isinstance(ra2, list):
-            arts.extend([a for a in ra2 if isinstance(a, dict)])
-
-        content = result.get("content")
-        if isinstance(content, list):
-            for c in content:
-                if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str):
-                    txt = c["text"]
-                    try:
-                        maybe = json.loads(txt)
-                        if isinstance(maybe, dict) and isinstance(maybe.get("artifacts"), list):
-                            arts.extend([a for a in maybe["artifacts"] if isinstance(a, dict)])
-                    except Exception:
-                        pass
+        _extract_artifacts_from_container(result, arts)
 
     return arts
 
 
 def _normalize_artifact(a: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Normalize an artifact envelope to engine-canon:
-      { "kind_id": str, "version": str|None, "data": object }
-    Also include 'kind' and 'body' for compatibility with other code paths.
+    Normalize an artifact envelope to engine-canon.
+    Accept synonyms: kindId, schemaVersion, payload.
     """
-    kind_id = a.get("kind_id") or a.get("kind")
-    version = a.get("version") or a.get("schema_version") or a.get("ver")
-    data = a.get("data") or a.get("body") or {}
-    norm = {
+    kind_id = a.get("kind_id") or a.get("kindId") or a.get("kind")
+    version = a.get("schema_version") or a.get("schemaVersion") or a.get("version") or a.get("ver")
+    # Payload keys we accept in priority order
+    if "data" in a and a.get("data") is not None:
+        data = a.get("data")
+    elif "payload" in a and a.get("payload") is not None:
+        data = a.get("payload")
+    else:
+        data = a.get("body") or {}
+
+    return {
         "kind_id": kind_id,
         "version": version,
+        "schema_version": version,
         "data": data,
         # Back-compat mirrors
         "kind": kind_id,
         "body": data,
     }
-    return norm
 
 
 def _normalize_artifacts(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -146,10 +241,6 @@ def _normalize_artifacts(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _dedupe_artifacts(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    De-duplicate by (kind_id, version, data JSON) to avoid double counting the same artifact
-    when it appears in both structuredContent and content.text JSON.
-    """
     seen: set[Tuple[str, str, str]] = set()
     uniq: List[Dict[str, Any]] = []
     for it in items:
@@ -162,10 +253,6 @@ def _dedupe_artifacts(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _merge_items_into_context(ctx: Dict[str, Any], items: List[Dict[str, Any]]) -> int:
-    """
-    Merge normalized artifacts into context as:
-      context[kind_id] += [{ "data": <payload> }]
-    """
     if not isinstance(ctx, dict):
         return 0
     merged = 0
@@ -180,9 +267,6 @@ def _merge_items_into_context(ctx: Dict[str, Any], items: List[Dict[str, Any]]) 
 
 
 def _update_repo_hints(state: Dict[str, Any], items: List[Dict[str, Any]]) -> None:
-    """
-    Persist handy repo hints across steps so downstream tools can default args.
-    """
     hints = state.setdefault("_hints", {})
     for it in items:
         if (it.get("kind_id") or it.get("kind")) == "cam.asset.repo_snapshot":
@@ -205,13 +289,6 @@ async def _resolve_integration_snapshot(
     capability_id: Optional[str],
     correlation_id: Optional[str],
 ) -> Dict[str, Any]:
-    """
-    Resolve to a concrete integration snapshot, with these fallbacks:
-      1) step.integration.integration_snapshot
-      2) cap.integration.integration_snapshot
-      3) step/cap integration_ref -> GET /integration/{id}
-      4) capability_id -> GET /capability/{id} -> integration_ref -> GET /integration/{id}
-    """
     integ = dict(step_integration or {}) or dict(cap_integration or {})
 
     snap = integ.get("integration_snapshot") or {}
@@ -247,7 +324,7 @@ async def _resolve_integration_snapshot(
 
 
 def _args_preview(args: Dict[str, Any]) -> Dict[str, Any]:
-    keys = {"url", "branch", "revision", "dest", "root", "paths", "dialect"}
+    keys = {"url", "branch", "revision", "dest", "root", "paths", "dialect", "allow_missing_kinds"}
     preview: Dict[str, Any] = {}
     for k, v in args.items():
         if k in keys or isinstance(v, (str, int, float, bool)):
@@ -270,25 +347,24 @@ def _mcp_error_text(out: Dict[str, Any]) -> str:
     return "MCP returned an error"
 
 
-def _latest_repo_root_from_context(ctx: Dict[str, Any]) -> Optional[str]:
-    lst = (ctx or {}).get("cam.asset.repo_snapshot") or []
-    if not isinstance(lst, list) or not lst:
-        return None
-    last = lst[-1]
-    if isinstance(last, dict):
-        b = last.get("data") or last.get("body") or last
-        if isinstance(b, dict):
-            root = b.get("paths_root")
-            if isinstance(root, str) and root.strip():
-                return root
+def _find_tool_schema(snapshot: dict, tool_name: str) -> Optional[dict]:
+    for t in (snapshot.get("tools") or []):
+        if t.get("name") == tool_name:
+            return t.get("inputSchema") or t.get("input_schema") or {}
     return None
 
 
+def _filter_args_by_schema(schema: dict, args: dict) -> dict:
+    if not isinstance(schema, dict):
+        return dict(args)
+    props = schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return dict(args)
+    allowed = set(props.keys())
+    return {k: v for k, v in args.items() if k in allowed}
+
+
 async def exec_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Execute MCP tools for the current step; normalize artifacts to {kind_id,version,data};
-    log raw returns + kinds; merge into context; persist repo hints; default parse_tree.root.
-    """
     idx = state.get("_step_index", 0)
     step = (state["plan"]["steps"])[idx]
     step_id = step.get("id") or f"step{idx+1}"
@@ -306,7 +382,6 @@ async def exec_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
         correlation_id=correlation_id,
     )
 
-    # Runtime vars baseline
     workspace_folder = (
         (state.get("options") or {}).get("workspace_folder")
         or os.getenv("WORKSPACE_FOLDER")
@@ -315,26 +390,21 @@ async def exec_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
     )
     runtime_vars = {"workspaceFolder": workspace_folder}
 
-    # Inputs → flat vars
     inputs = state.get("inputs") or {}
     base_vars: Dict[str, Any] = dict(runtime_vars)
     _flatten("", inputs, base_vars)
 
-    # Carry across persistent repo hints from previous steps
     hints = state.get("_hints") or {}
     if isinstance(hints, dict):
         base_vars.update(hints)
 
-    # Convenience aliases from inputs.repos[0]
     repos = (inputs.get("repos") or [])
     if repos and isinstance(repos, list) and isinstance(repos[0], dict):
         base_vars.setdefault("git.url", repos[0].get("url"))
         base_vars.setdefault("git.branch", repos[0].get("revision") or repos[0].get("branch"))
 
-    # Ensure context bucket exists
     ctx = state.setdefault("context", {})
 
-    # Transport log
     t = snapshot.get("transport") or {}
     logger.info(
         "MCP(exec): step=%s transport.kind=%s command=%s base_url=%s cwd=%s",
@@ -350,29 +420,15 @@ async def exec_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
             timeout_sec = spec.get("timeout_sec")
             retries = int(spec.get("retries", 0))
 
-            # Build vars for this call (include latest context-derived vars)
             vars_map: Dict[str, Any] = dict(base_vars)
             _inject_context_vars(vars_map, ctx)
 
-            # Build and interpolate args
-            args: Dict[str, Any] = dict(spec.get("args") or {})
-            args.update(dict(step.get("params") or {}))
-            # NOTE: Some MCP tools validate strictly; avoid sending extra keys they don't expect.
+            raw_args: Dict[str, Any] = dict(spec.get("args") or {})
+            raw_args.update(dict(step.get("params") or {}))
+            interpolated = _interpolate(raw_args, vars_map)
 
-            args = _interpolate(args, vars_map)
-
-            # Special default: if parse_tree.root is empty, use latest repo snapshot
-            if tool == "parse_tree":
-                need_root = not isinstance(args.get("root"), str) or not args.get("root", "").strip()
-                if need_root:
-                    auto_root = (
-                        _latest_repo_root_from_context(ctx)
-                        or (state.get("_hints") or {}).get("repo.paths_root")
-                        or vars_map.get("repo.paths_root")
-                    )
-                    if isinstance(auto_root, str) and auto_root.strip():
-                        args["root"] = auto_root
-                        logger.info("MCP(args): step=%s tool=%s defaulted root=%s", step_id, tool, auto_root)
+            tool_schema = _find_tool_schema(snapshot, tool)
+            args = _filter_args_by_schema(tool_schema or {}, interpolated)
 
             logger.info(
                 "MCP(tool): step=%s tool=%s retries=%s timeout=%s args=%s",
@@ -383,17 +439,25 @@ async def exec_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
             error: Optional[str] = None
             produced = 0
             kinds: List[str] = []
+            zero_warned = False
 
             try:
                 out = await inv.call_tool(tool, args, timeout_sec=timeout_sec, retries=retries, correlation_id=correlation_id)
 
-                # Log raw server return
                 logger.info("MCP(raw): step=%s tool=%s out=%s", step_id, tool, _short_json(out))
 
-                if isinstance(out, dict) and out.get("isError") is True:
-                    raise RuntimeError(_mcp_error_text(out))
+                maybe = _maybe_unwrap_result(out)
+                if isinstance(maybe, dict) and maybe.get("isError") is True:
+                    raise RuntimeError(_mcp_error_text(maybe))
 
                 raw_items = _extract_artifacts(out)
+                if not raw_items and isinstance(maybe, dict) and not zero_warned:
+                    zero_warned = True
+                    logger.warning(
+                        "MCP(extract): step=%s tool=%s produced 0 artifacts; top-level keys=%s",
+                        step_id, tool, _collect_top_keys(maybe),
+                    )
+
                 items = _normalize_artifacts(raw_items)
                 items = _dedupe_artifacts(items)
 
@@ -401,17 +465,10 @@ async def exec_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 kinds = [i.get("kind_id") or "" for i in items]
                 logger.info("MCP(result): step=%s tool=%s produced=%d kinds=%s", step_id, tool, produced, kinds)
 
-                # Merge into context for downstream steps
                 _merge_items_into_context(ctx, items)
-                # Persist repo hints across steps
                 _update_repo_hints(state, items)
                 results.extend(items)
 
-                # Gate: clone must produce repo snapshot before any downstream step that needs root
-                if tool == "clone_repo" and "cam.asset.repo_snapshot" not in kinds:
-                    raise RuntimeError("clone_repo did not return cam.asset.repo_snapshot; halting pipeline")
-
-                # After successful call, refresh base vars from updated context + hints
                 base_vars = dict(runtime_vars)
                 _flatten("", inputs, base_vars)
                 if isinstance(state.get("_hints"), dict):
@@ -448,10 +505,9 @@ async def exec_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     pass
 
             if error:
-                # Stop this node on failure so the graph can report the error clearly
                 raise RuntimeError(error)
 
-    state["last_output"] = results  # normalized artifacts with kind_id/version/data (+ kind/body)
+    state["last_output"] = results
     state["last_stats"] = {"produced_total": len(results)}
     state["context"] = ctx
     return state

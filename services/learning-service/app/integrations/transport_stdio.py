@@ -1,3 +1,4 @@
+# services/learning-service/app/integrations/transport_stdio.py
 from __future__ import annotations
 
 import asyncio
@@ -14,12 +15,23 @@ logger = logging.getLogger("app.transport.stdio")
 
 class StdioTransport:
     """
-    Persistent STDIO transport using JSON-RPC 2.0 over newline-delimited frames.
+    Persistent STDIO transport using JSON-RPC 2.0.
 
     Protocol implemented:
       - initialize  -> result with serverInfo/capabilities
       - notifications/initialized (fire-and-forget)
       - tools/call  -> invoke a named tool with arguments
+
+    Framing support:
+      - MCP framed mode:   `Content-Length: N\\r\\n\\r\\n<JSON bytes>`
+      - Line-delimited:    one compact JSON object per line
+
+    Behavior:
+      - If timeout_sec=None is passed to call_tool(), we will wait indefinitely
+        for the server's response UNLESS the underlying process exits; in that case
+        we raise RuntimeError("STDIO process closed before response").
+      - We do not inspect or mutate tool arguments here; higher layers remain
+        responsible for interpolation/validation.
     """
 
     def __init__(
@@ -60,7 +72,8 @@ class StdioTransport:
         self._stderr_reader_task: Optional[asyncio.Task] = None
 
         # Queues
-        self._resp_q: asyncio.Queue[str] = asyncio.Queue()
+        # Parsed JSON objects (dict) are pushed here by the reader.
+        self._resp_q: asyncio.Queue[Any] = asyncio.Queue()
         self._ready_q: asyncio.Queue[str] = asyncio.Queue()
 
         # State
@@ -157,23 +170,66 @@ class StdioTransport:
     # ---------- IO readers ----------
 
     async def _reader_stdout(self, stream: asyncio.StreamReader) -> None:
+        """
+        Supports BOTH:
+          1) MCP framing:   Content-Length: N\\r\\n\\r\\n<JSON bytes...>
+          2) Line-delimited: one compact JSON object per line
+
+        Every parsed JSON object (dict) is put onto _resp_q.
+        """
         try:
             while True:
-                line_bytes = await stream.readline()
-                if not line_bytes:
+                # Try to read the first header/line
+                header_line = await stream.readline()
+                if not header_line:
                     break
-                line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
-                # readiness banners may be printed on stdout
+                header_text = header_line.decode("utf-8", errors="replace").rstrip("\r\n")
+
+                # Some servers print readiness banners on stdout as well
                 try:
-                    self._ready_q.put_nowait(line)
+                    self._ready_q.put_nowait(header_text)
                 except Exception:
                     pass
-                # JSON-RPC responses are one-per-line; deliver raw to resp_q
-                try:
-                    self._resp_q.put_nowait(line)
-                except Exception:
-                    pass
+
+                if header_text.lower().startswith("content-length:"):
+                    # -------- Framed mode (MCP) --------
+                    try:
+                        _, n_str = header_text.split(":", 1)
+                        length = int(n_str.strip())
+                    except Exception:
+                        # Malformed header; skip to next line
+                        continue
+                    # Expect the blank line separator
+                    sep = await stream.readline()  # should be b"\r\n" or b"\n"
+                    if not sep:
+                        break
+                    # Read exactly N bytes for the JSON body
+                    try:
+                        body = await stream.readexactly(length)
+                    except asyncio.IncompleteReadError as e:
+                        # Process likely exited; stop reader
+                        break
+                    try:
+                        obj = json.loads(body.decode("utf-8", errors="replace"))
+                        self._resp_q.put_nowait(obj)
+                    except Exception:
+                        # If body isn't JSON, ignore and continue
+                        continue
+                else:
+                    # -------- Fallback line-delimited mode --------
+                    line = header_text
+                    # Only attempt to parse if it looks like a JSON object/array
+                    if not line or not (line.lstrip().startswith("{") or line.lstrip().startswith("[")):
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        self._resp_q.put_nowait(obj)
+                    except Exception:
+                        # If pretty-printed JSON arrives without framing, we don't accumulate here
+                        # to avoid blocking; servers should emit compact JSON for this mode.
+                        continue
         except Exception:
+            # Never crash the process because of reader issues; let caller handle timeouts.
             pass
 
     async def _reader_stderr(self, stream: asyncio.StreamReader) -> None:
@@ -206,23 +262,44 @@ class StdioTransport:
         self._proc.stdin.write(frame.encode("utf-8"))
         await self._proc.stdin.drain()
 
-    async def _wait_for_response(self, req_id: str, timeout: float) -> Dict[str, Any]:
-        """Drain _resp_q until a JSON object with matching id arrives."""
-        deadline = asyncio.get_event_loop().time() + timeout
-        while True:
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError()
-            try:
-                line = await asyncio.wait_for(self._resp_q.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                raise
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if obj.get("id") == req_id:
-                return obj
+    async def _wait_for_response(self, req_id: str, timeout: Optional[float]) -> Dict[str, Any]:
+        """
+        Drain _resp_q until a JSON object with matching id arrives.
+
+        If timeout is None, wait indefinitely (until a matching response arrives) unless
+        the subprocess exits and the response queue is empty, in which case raise RuntimeError.
+        """
+        loop = asyncio.get_event_loop()
+
+        if timeout is None:
+            while True:
+                # If the process died and there's nothing left to read, abort.
+                if self._proc and self._proc.returncode is not None and self._resp_q.empty():
+                    raise RuntimeError("STDIO process closed before response")
+                item = await self._resp_q.get()
+                obj = item if isinstance(item, dict) else None
+                if isinstance(item, str):
+                    try:
+                        obj = json.loads(item)
+                    except Exception:
+                        obj = None
+                if isinstance(obj, dict) and obj.get("id") == req_id:
+                    return obj
+        else:
+            deadline = loop.time() + float(timeout)
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                item = await asyncio.wait_for(self._resp_q.get(), timeout=remaining)
+                obj = item if isinstance(item, dict) else None
+                if isinstance(item, str):
+                    try:
+                        obj = json.loads(item)
+                    except Exception:
+                        obj = None
+                if isinstance(obj, dict) and obj.get("id") == req_id:
+                    return obj
 
     async def _handshake(self) -> None:
         """initialize -> result, then send notifications/initialized (no response)."""
@@ -245,12 +322,16 @@ class StdioTransport:
         args: Dict[str, Any],
         *,
         timeout_sec: Optional[float] = None,
-        correlation_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,  # kept for symmetry; unused here
     ) -> Any:
         """
         Invoke a tool via JSON-RPC:
           method: "tools/call"
           params: { "name": <tool>, "arguments": { ... } }
+
+        Behavior:
+          - If timeout_sec is None, wait indefinitely for the response (unless the process exits).
+          - If timeout_sec is a number, enforce it and raise TimeoutError on expiry.
         """
         await self._ensure_connected()
         assert self._proc is not None
@@ -273,10 +354,8 @@ class StdioTransport:
         async with self._lock:
             await self._send_json(payload)
 
-            # Wait for the matching response
-            deadline = float(timeout_sec or 60.0)
             try:
-                resp = await self._wait_for_response(req_id, timeout=deadline)
+                resp = await self._wait_for_response(req_id, timeout=timeout_sec)
             except asyncio.TimeoutError:
                 raise TimeoutError(f"STDIO tool call timed out: {tool}")
 

@@ -43,6 +43,8 @@ async def seed_capabilities() -> None:
     Steps:
       1) Try to wipe all existing capabilities using any available service method.
       2) Replace-by-id for each new capability (delete-if-exists → create).
+
+    NOTE: MCPToolCallSpec.timeout_sec must be an int ≤ 3600 (per model constraints).
     """
     log.info("[capability.seeds] Begin")
 
@@ -53,7 +55,9 @@ async def seed_capabilities() -> None:
     if not wiped:
         log.info("[capability.seeds] No wipe method found; proceeding with replace-by-id for targets")
 
-    # 2) New targets (EXACTLY as provided)
+    LONG_TIMEOUT = 3600  # model-enforced maximum
+
+    # 2) New targets
     targets: list[GlobalCapabilityCreate] = [
         GlobalCapabilityCreate(
             id="cap.repo.clone",
@@ -66,7 +70,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="clone_repo",
                         output_kinds=["cam.asset.repo_snapshot"],
-                        timeout_sec=300,
+                        timeout_sec=LONG_TIMEOUT,
                         retries=1,
                     )
                 ],
@@ -83,7 +87,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="index_sources",
                         output_kinds=["cam.asset.source_file"],
-                        timeout_sec=300,
+                        timeout_sec=LONG_TIMEOUT,
                         retries=1,
                     )
                 ],
@@ -93,14 +97,14 @@ async def seed_capabilities() -> None:
             id="cap.cobol.parse",
             name="Parse COBOL Programs and Copybooks",
             description="Parses COBOL source files and extracts program and copybook structures.",
-            produces_kinds=["cam.cobol.program", "cam.cobol.copybook"],
+            produces_kinds=["cam.cobol.program","cam.asset.source_index"],
             integration=MCPIntegrationBinding(
                 integration_ref="mcp.cobol.parser",
                 tool_calls=[
                     MCPToolCallSpec(
                         tool="parse_tree",
-                        output_kinds=["cam.cobol.program", "cam.cobol.copybook"],
-                        timeout_sec=300,
+                        output_kinds=["cam.cobol.program", "cam.asset.source_index"],
+                        timeout_sec=LONG_TIMEOUT,
                         retries=1,
                     )
                 ],
@@ -117,7 +121,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="parse_jcl",
                         output_kinds=["cam.jcl.job", "cam.jcl.step"],
-                        timeout_sec=300,
+                        timeout_sec=LONG_TIMEOUT,
                         retries=1,
                     )
                 ],
@@ -134,7 +138,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="list_transactions",
                         output_kinds=["cam.cics.transaction"],
-                        timeout_sec=300,
+                        timeout_sec=LONG_TIMEOUT,
                         retries=1,
                     )
                 ],
@@ -151,7 +155,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="export_schema",
                         output_kinds=["cam.data.model"],
-                        timeout_sec=120,
+                        timeout_sec=LONG_TIMEOUT,
                         retries=1,
                     )
                 ],
@@ -168,7 +172,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="index",
                         output_kinds=["cam.asset.service_inventory", "cam.asset.dependency_inventory"],
-                        timeout_sec=90,
+                        timeout_sec=LONG_TIMEOUT,
                         retries=1,
                     )
                 ],
@@ -200,7 +204,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="derive_lineage",
                         output_kinds=["cam.data.lineage"],
-                        timeout_sec=120,
+                        timeout_sec=LONG_TIMEOUT,
                         retries=1,
                     )
                 ],
@@ -217,7 +221,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="mine_batch",
                         output_kinds=["cam.workflow.process"],
-                        timeout_sec=120,
+                        timeout_sec=LONG_TIMEOUT,
                         retries=1,
                     )
                 ],
@@ -258,7 +262,7 @@ async def seed_capabilities() -> None:
                             "cam.diagram.deployment",
                             "cam.diagram.state",
                         ],
-                        timeout_sec=120,
+                        timeout_sec=LONG_TIMEOUT,
                         retries=1,
                     )
                 ],
