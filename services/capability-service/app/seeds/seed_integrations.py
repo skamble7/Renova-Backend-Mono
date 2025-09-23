@@ -1,4 +1,3 @@
-# services/capability-service/app/seeds/seed_integrations.py
 from __future__ import annotations
 
 import logging
@@ -24,14 +23,10 @@ def _transport_str(t) -> str:
 
 async def seed_integrations() -> None:
     """
-    Reseat integrations to the transport-based MCPIntegration shape.
-
-    Notes:
-    - mcp.git and mcp.cobol.parser are launched via `docker run` with the
-      project root mounted at /mnt/work inside the tool containers.
-    - We DO NOT wait for a readiness banner (readiness_regex=None) because the
-      containers don’t emit a stable line. The STDIO bridge will be ready to
-      receive tool calls immediately.
+    Reseat integrations to the NEW transport-based MCPIntegration shape.
+    - Deletes existing known IDs (old http-based + any prior variants).
+    - Recreates stdio-based integrations.
+    - mcp.git and mcp.cobol.parser are configured to inherit volumes from renova-learning-service.
     """
     log.info("[capability.seeds.integrations] Begin")
     svc = IntegrationService()
@@ -48,7 +43,7 @@ async def seed_integrations() -> None:
         "mcp.lineage.engine",
         "mcp.workflow.miner",
         "mcp.diagram.exporter",
-        "mcp.cobol.callgraph",  # legacy
+        "mcp.cobol.callgraph",
     ]
     for oid in delete_ids:
         try:
@@ -63,7 +58,7 @@ async def seed_integrations() -> None:
 
     # 2) Define integrations
     targets = [
-        # ----- mcp.git via docker run (stdio) -----
+        # ----- mcp.git via docker run (stdio), inheriting parent mounts -----
         MCPIntegration(
             id="mcp.git",
             name="Git MCP",
@@ -76,27 +71,26 @@ async def seed_integrations() -> None:
                     "run",
                     "--rm",
                     "-i",
-                    "-v", "${workspaceFolder}:/mnt/work",
+                    "--volumes-from", "renova-learning-service",  # <-- inherit /workspace bind
                     "-w", "/opt/renova/tools/git",
                     "-e", "LOG_LEVEL=info",
-                    "-e", "REPO_WORK_ROOT=/mnt/work/.renova/src",
-                    "-e", "REPO_CACHE=/mnt/work/.renova/cache",
+                    "-e", "REPO_WORK_ROOT=/workspace/.renova/src",
+                    "-e", "REPO_CACHE=/workspace/.renova/cache",
                     "-e", "GIT_ALLOWED_HOSTS=github.com,git.example.com",
                     "-e", "GIT_DISABLE_REFERENCE=1",
                     "git-mcp:dev",
                     "--stdio",
                 ],
-                # Launch docker from the repo root (safer if you later use relative paths)
-                cwd="${workspaceFolder}",
-                env={},            # everything the tool needs is passed into the container via -e above
+                cwd=None,                 # no need; all paths are absolute in the child
+                env={},
                 env_aliases={},
                 restart_on_exit=True,
-                readiness_regex=None,  # <— do not wait for a banner; start immediately
+                readiness_regex=None,     # server doesn't print a ready banner; don't wait
                 kill_timeout_sec=10,
             ),
         ),
 
-        # ----- mcp.cobol.parser via docker run (stdio) -----
+        # ----- mcp.cobol.parser via docker run (stdio), inheriting parent mounts -----
         MCPIntegration(
             id="mcp.cobol.parser",
             name="COBOL Parser MCP",
@@ -109,27 +103,25 @@ async def seed_integrations() -> None:
                     "run",
                     "--rm",
                     "-i",
-                    "-v", "${workspaceFolder}:/mnt/work",
+                    "--volumes-from", "renova-learning-service",  # <-- inherit /workspace bind
                     "-w", "/opt/renova/tools/cobol-parser",
                     "-e", "LOG_LEVEL=info",
                     "-e", "COBOL_DIALECT=COBOL85",
-                    "-e", "WORKSPACE_HOST=${workspaceFolder}",
-                    "-e", "WORKSPACE_CONTAINER=/mnt/work",
-                    # cb2xml (optional)
+                    "-e", "WORKSPACE_HOST=/workspace",
+                    "-e", "WORKSPACE_CONTAINER=/workspace",
                     "-e", "CB2XML_CLASSPATH=/opt/cb2xml/lib/*",
                     "-e", "CB2XML_MAIN=net.sf.cb2xml.Cb2Xml",
-                    # ProLeap bridge
                     "-e", "PROLEAP_CLASSPATH=/opt/proleap/lib/proleap-cli-bridge.jar",
                     "-e", "PROLEAP_MAIN=com.renova.proleap.CLI",
-                    # debug dumps
-                    "-e", "RAW_AST_DUMP_DIR=/mnt/work/.renova/debug/raw-ast",
+                    "-e", "RAW_AST_DUMP_DIR=/workspace/.renova/debug/raw-ast",
                     "cobol-parser-mcp:dev",
+                    "--stdio",
                 ],
-                cwd="${workspaceFolder}",
+                cwd=None,
                 env={},
                 env_aliases={},
                 restart_on_exit=True,
-                readiness_regex=None,  # <— do not wait for a banner to avoid startup timeout
+                readiness_regex=None,     # avoid readiness wait unless the server prints it
                 kill_timeout_sec=10,
             ),
         ),

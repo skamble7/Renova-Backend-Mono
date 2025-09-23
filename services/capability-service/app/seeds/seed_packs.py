@@ -79,7 +79,7 @@ async def _create_refresh_publish(svc: PackService, payload: CapabilityPackCreat
 async def seed_packs() -> None:
     """
     Seed TWO capability packs under the same key 'cobol-mainframe':
-      1) v1.0.1 (existing full-flow pack) — preserved as-is.
+      1) v1.0.1 (existing full-flow pack) — same flow, but clone step no longer forces an absolute dest.
       2) v1.0.2 (new minimal pack) — two-step playbook: cap.repo.clone -> cap.cobol.parse.
 
     If PACK_SEED_PUBLISH=1, both will be published after snapshot refresh.
@@ -90,14 +90,12 @@ async def seed_packs() -> None:
     svc = PackService()
 
     pack_key = "cobol-mainframe"
-    full_version = "v1.0.1"   # existing full pack (unchanged)
+    full_version = "v1.0.1"   # existing full pack (dest removed in clone)
     mini_version = "v1.0.2"   # new derived minimal pack
 
     # -------------------------------
-    # Pack #1: Full-flow v1.0.1 (UNCHANGED)
+    # Pack #1: Full-flow v1.0.1
     # -------------------------------
-    # Do NOT delete v1.0.1 unless we're re-seeding the exact same version for idempotency.
-    # We only remove the same version if present to allow updates in a controlled re-run.
     await _delete_pack_if_exists(svc, pack_key, full_version)
 
     pb_main = Playbook(
@@ -110,7 +108,13 @@ async def seed_packs() -> None:
                 name="Clone Repo",
                 capability_id="cap.repo.clone",
                 description="Clone source repository; records commit and paths_root.",
-                params={"url": "${git.url}", "branch": "${git.branch:-main}", "depth": 0, "dest": "${repo.dest:-/mnt/src}"},
+                # Let git-mcp choose a safe relative folder under its REPO_WORK_ROOT.
+                # If callers want to control it, they can supply repo.dest externally (relative).
+                params={
+                    "url": "${git.url}",
+                    "branch": "${git.branch:-main}",
+                    "depth": 0,
+                },
             ),
             PlaybookStep(
                 id="s2.cobol",
@@ -211,7 +215,6 @@ async def seed_packs() -> None:
     # -------------------------------
     # Pack #2: Minimal two-step v1.0.2 (NEW)
     # -------------------------------
-    # Only delete same-version (v1.0.2) for idempotent reseeding; DO NOT touch v1.0.1.
     await _delete_pack_if_exists(svc, pack_key, mini_version)
 
     pb_core = Playbook(
@@ -224,7 +227,12 @@ async def seed_packs() -> None:
                 name="Clone Repo",
                 capability_id="cap.repo.clone",
                 description="Clone source repository; records commit and paths_root.",
-                params={"url": "${git.url}", "branch": "${git.branch:-main}", "depth": 0, "dest": "${repo.dest:-/mnt/src}"},
+                # No absolute dest; git-mcp will derive a relative folder under REPO_WORK_ROOT.
+                params={
+                    "url": "${git.url}",
+                    "branch": "${git.branch:-main}",
+                    "depth": 0,
+                },
             ),
             PlaybookStep(
                 id="s2.cobol",

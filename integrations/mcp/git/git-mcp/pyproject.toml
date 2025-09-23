@@ -9,9 +9,19 @@ description = "MCP stdio server exposing deterministic Git tools"
 authors = [{ name = "Renova" }]
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-  "jsonschema>=4.22.0",
-]
+dependencies = ["jsonschema>=4.22.0"]
 
 [project.scripts]
 git-mcp = "git_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["git_mcp*"]
+
+# <-- this line is the key: ship the schema files
+[tool.setuptools.package-data]
+git_mcp = ["schemas/*.json"]

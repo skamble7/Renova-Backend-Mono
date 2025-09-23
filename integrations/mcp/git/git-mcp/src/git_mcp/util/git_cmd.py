@@ -1,4 +1,3 @@
-# integrations/mcp/git/git-mcp/src/git_mcp/util/git_cmd.py
 from __future__ import annotations
 
 import hashlib
@@ -16,15 +15,48 @@ class GitError(RuntimeError):
     pass
 
 
-def _run(cmd: list[str], cwd: Optional[str] = None, extra_env: Optional[dict] = None) -> str:
+def _base_git_env() -> dict:
+    """
+    Environment knobs to avoid hangs and fail fast on bad networks.
+    You can override via container env if needed.
+    """
+    env = {
+        # never prompt in headless environments
+        "GIT_TERMINAL_PROMPT": os.getenv("GIT_TERMINAL_PROMPT", "1" if os.getenv("GIT_HTTP_TOKEN") else "0"),
+        "GIT_ASKPASS": os.getenv("GIT_ASKPASS", "echo"),
+        # bail out if the connection is too slow or stalls
+        "GIT_HTTP_LOW_SPEED_LIMIT": os.getenv("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),  # bytes/sec
+        "GIT_HTTP_LOW_SPEED_TIME": os.getenv("GIT_HTTP_LOW_SPEED_TIME", "20"),      # seconds
+        # pass through proxies if present
+        "HTTP_PROXY": os.getenv("HTTP_PROXY", ""),
+        "HTTPS_PROXY": os.getenv("HTTPS_PROXY", ""),
+        "NO_PROXY": os.getenv("NO_PROXY", ""),
+    }
+    # Drop empty proxy keys to avoid overriding Docker defaults
+    return {k: v for k, v in env.items() if v}
+
+
+def _run(cmd: list[str], cwd: Optional[str] = None, extra_env: Optional[dict] = None, *, timeout: Optional[int] = None) -> str:
     env = os.environ.copy()
+    env.update(_base_git_env())
     if extra_env:
         env.update(extra_env)
+    # default timeout per git command
+    timeout = timeout or int(os.getenv("GIT_CMD_TIMEOUT_SEC", "120"))
     try:
-        out = subprocess.check_output(cmd, cwd=cwd, env=env, stderr=subprocess.STDOUT, text=True)
+        out = subprocess.check_output(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
         return out.strip()
     except subprocess.CalledProcessError as e:
         raise GitError(f"git failed: {' '.join(map(shlex.quote, cmd))}\n{e.output}") from e
+    except subprocess.TimeoutExpired as e:
+        raise GitError(f"git timeout after {timeout}s: {' '.join(map(shlex.quote, cmd))}") from e
 
 
 def enforce_allowed_host(url: str, allowed_hosts: Optional[set[str]]) -> None:
@@ -86,13 +118,15 @@ def clone_or_update(
     use_reference: bool = True,
 ) -> Tuple[str, str]:
     """
-    Ensure dest is a checkout of `url` at `branch`.
+    Ensure dest is a checkout of `url` at `branch` under `work_root`.
     Returns (commit_sha, dest_path). Falls back to no-reference clone if needed.
     """
     allowed = set(os.getenv("GIT_ALLOWED_HOSTS", "").split(",")) if os.getenv("GIT_ALLOWED_HOSTS") else None
     enforce_allowed_host(url, allowed)
 
-    dest_p = ensure_under_root(work_root, dest)
+    # Never allow escaping the work root; treat absolute dests as relative.
+    safe_dest = dest.lstrip("/")
+    dest_p = ensure_under_root(work_root, safe_dest)
     dest_p.parent.mkdir(parents=True, exist_ok=True)
 
     cache = None
@@ -117,9 +151,8 @@ def clone_or_update(
     try:
         _do_clone(reference_ok=use_reference)
     except GitError as e1:
-        # Fallback to no-reference clone
         if use_reference:
-            # best-effort cleanup of partial dest
+            # Fallback: clean partial dest then clone without reference
             if dest_p.exists():
                 for p in sorted(dest_p.glob("**/*"), reverse=True):
                     try:
@@ -139,7 +172,9 @@ def clone_or_update(
     sha = _run(["git", "-C", str(dest_p), "rev-parse", "HEAD"])
     return sha, str(dest_p)
 
+def resolve_ref(root_path: str, ref: str) -> str:
+    """
+    Return the full commit SHA for `ref` (e.g., 'HEAD', 'main', 'origin/main').
+    """
+    return _run(["git", "-C", root_path, "rev-parse", "--verify", ref])
 
-def resolve_ref(root: str, ref: str) -> str:
-    """Return a full commit SHA for `ref` (e.g., HEAD, branch, tag)."""
-    return _run(["git", "-C", root, "rev-parse", ref])
