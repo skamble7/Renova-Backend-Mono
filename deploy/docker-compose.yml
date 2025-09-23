@@ -41,3 +41,63 @@ services:
       - "9012:9012"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  renova-learning-service:
+    build:
+      context: ..
+      dockerfile: services/learning-service/Dockerfile
+    container_name: renova-learning-service
+    restart: unless-stopped
+    depends_on:
+      - renova-artifact-service
+      - renova-capability-service
+    env_file:
+      - ../services/learning-service/.env.example
+    environment:
+      # Core
+      SERVICE_NAME: learning-service
+      SERVICE_PORT: ${SERVICE_PORT:-9013}
+
+      # Mongo
+      MONGO_URI: ${MONGO_URI:-mongodb+srv://sandeepk:sandeep@cluster0.tnbpi.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0}
+      MONGO_DB: ${MONGO_DB:-renova}
+
+      # Rabbit
+      RABBITMQ_URI: ${RABBITMQ_URI:-amqp://raina:raina@host.docker.internal:5672/}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-raina.events}
+      EVENTS_ORG: ${EVENTS_ORG:-renova}
+      PLATFORM_EVENTS_ORG: ${PLATFORM_EVENTS_ORG:-platform}
+
+      # Upstream services (use compose DNS names)
+      CAPABILITY_SERVICE_BASE_URL: ${CAPABILITY_SERVICE_BASE_URL:-http://renova-capability-service:9012}
+      ARTIFACT_SERVICE_BASE_URL: ${ARTIFACT_SERVICE_BASE_URL:-http://renova-artifact-service:9011}
+
+      # HTTP client defaults
+      HTTP_CLIENT_TIMEOUT_SECONDS: ${HTTP_CLIENT_TIMEOUT_SECONDS:-30}
+
+      # LLM config (optional overrides)
+      OPENAI_API_KEY: <OPENAI_API_KEY>
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.1}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-4000}
+      LLM_STRICT_JSON: ${LLM_STRICT_JSON:-1}
+
+      # MCP invocation knobs
+      MCP_HTTP_TIMEOUT: ${MCP_HTTP_TIMEOUT:-60}
+      MCP_STDIO_KILL_TIMEOUT: ${MCP_STDIO_KILL_TIMEOUT:-10}
+      MCP_STDIO_STARTUP_TIMEOUT: ${MCP_STDIO_STARTUP_TIMEOUT:-20}
+      MCP_RETRY_MAX_ATTEMPTS: ${MCP_RETRY_MAX_ATTEMPTS:-2}
+      MCP_RETRY_BACKOFF_MS: ${MCP_RETRY_BACKOFF_MS:-250}
+
+      # Workspace path for stdio MCPs that expect ${workspaceFolder}
+      WORKSPACE_FOLDER: /workspace
+      workspaceFolder: /workspace
+    ports:
+      - "9013:9013"
+    volumes:
+      # Mount the repo root so tools can read/write .renova under the project
+      - ..:/workspace
+      # Let the service invoke `docker run` for the COBOL parser MCP
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
