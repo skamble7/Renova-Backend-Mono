@@ -9,31 +9,27 @@ import httpx
 class HTTPTransport:
     """
     Generic HTTP transport for MCP-like integrations.
-
-    Contract expectations (from integration snapshot):
-      transport.kind = "http"
-      transport.base_url : str
-      transport.headers? : dict[str,str] (static, non-secret)
-      transport.auth?    : { method: "none"|"bearer"|"basic"|"api_key", ... }
-      transport.invoke_path? : str (optional; default "/invoke")
-
-    Invocation:
-      POST {base_url}{invoke_path}
-      Body: { "tool": <str>, "args": <dict> }
-
-    The actual MCP server may expose a different contract; if your server uses JSON-RPC or a custom
-    route, set "invoke_path" in the integration snapshot or extend this transport.
     """
 
-    def __init__(self, integration_snapshot: Dict[str, Any], *, secret_resolver=None) -> None:
+    def __init__(self, integration_snapshot: Dict[str, Any], *, secret_resolver=None, runtime_vars: Optional[Dict[str, Any]] = None) -> None:
         self.snapshot = integration_snapshot or {}
         t = self.snapshot.get("transport") or {}
-        self.base_url: str = (t.get("base_url") or "").rstrip("/")
+        self._runtime_vars = runtime_vars or {}
+
+        def subst(s: Optional[str]) -> Optional[str]:
+            if not isinstance(s, str):
+                return s
+            out = s
+            for k, v in self._runtime_vars.items():
+                out = out.replace(f"${{{k}}}", str(v))
+            return out
+
+        self.base_url: str = (subst(t.get("base_url")) or "").rstrip("/")
         if not self.base_url:
             raise ValueError("HTTPTransport requires transport.base_url")
-        self.static_headers: Dict[str, str] = dict(t.get("headers") or {})
+        self.static_headers: Dict[str, str] = {k: subst(v) or "" for k, v in (t.get("headers") or {}).items()}
         self.auth: Dict[str, Any] = dict(t.get("auth") or {})
-        self.invoke_path: str = t.get("invoke_path") or "/invoke"
+        self.invoke_path: str = subst(t.get("invoke_path")) or "/invoke"
         self.timeout = float(os.getenv("MCP_HTTP_TIMEOUT", "60"))
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout)
         self._secret_resolver = secret_resolver

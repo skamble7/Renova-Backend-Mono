@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import httpx
 from pydantic import BaseModel
@@ -23,10 +23,12 @@ class CapabilityServiceClient:
     """
     Thin async client for capability-service.
 
-    Endpoints used now:
+    Endpoints used:
       - GET /capability/packs/{pack_id}/resolved
       - GET /capability/packs/{pack_id}
       - GET /capability/{capability_id}
+      - GET /integration/{integration_id}        <-- added
+      - GET /integration                          <-- optional helper
       - GET /health
     """
 
@@ -89,7 +91,7 @@ class CapabilityServiceClient:
 
     async def get_resolved_pack(self, pack_id: str, *, correlation_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Fetch the ResolvedPackView for a published pack (capability snapshots included).
+        Fetch the ResolvedPackView for a published pack (server-flattened steps, may omit capabilities[]).
         GET /capability/packs/{pack_id}/resolved
         """
         return await self._request("GET", f"/capability/packs/{pack_id}/resolved", correlation_id=correlation_id)
@@ -107,3 +109,33 @@ class CapabilityServiceClient:
         GET /capability/{capability_id}
         """
         return await self._request("GET", f"/capability/{capability_id}", correlation_id=correlation_id)
+
+    async def get_integration(self, integration_id: str, *, correlation_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fetch a single MCP integration by ID.
+        GET /integration/{integration_id}
+        """
+        return await self._request("GET", f"/integration/{integration_id}", correlation_id=correlation_id)
+
+    async def list_integrations(
+        self,
+        *,
+        q: Optional[str] = None,
+        tag: Optional[str] = None,
+        kind: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        correlation_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        List/search integrations.
+        GET /integration?q=&tag=&kind=&limit=&offset=
+        """
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if q is not None:
+            params["q"] = q
+        if tag is not None:
+            params["tag"] = tag
+        if kind is not None:
+            params["kind"] = kind
+        return await self._request("GET", "/integration", params=params, correlation_id=correlation_id)

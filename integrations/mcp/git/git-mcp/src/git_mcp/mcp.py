@@ -1,3 +1,4 @@
+# integrations/mcp/git/git-mcp/src/git_mcp/mcp.py
 from __future__ import annotations
 
 import json

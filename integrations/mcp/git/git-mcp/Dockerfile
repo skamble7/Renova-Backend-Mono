@@ -1,3 +1,4 @@
+#integrations/mcp/git/git-mcp/Dockerfile
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \

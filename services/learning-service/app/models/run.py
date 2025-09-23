@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, HttpUrl, UUID4
+from pydantic import BaseModel, Field, HttpUrl, UUID4, ConfigDict
 
 
 # ─────────────────────────────────────────────────────────────
@@ -41,16 +41,15 @@ class LearningInputs(BaseModel):
 
 
 class LearningOptions(BaseModel):
-    """
-    Execution knobs for the run; these can be extended later.
-    """
-    model: Optional[str] = Field(default=None, description="Override LLM model for LLM-mode capabilities.")
-    dry_run: bool = False
-    validate: bool = True
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    # rename to avoid shadowing BaseModel.validate
+    validate_: bool = Field(True, alias="validate")
     strict_json: bool = True
+    dry_run: bool = False
     allow_partial_step_failures: bool = False
-    # If provided, forces the run strategy. Otherwise the service decides (first run → baseline, else delta).
-    strategy_hint: Optional[Literal["baseline", "delta"]] = None
+    model: str | None = None
+    strategy_hint: str | None = None
 
 
 class StartLearningRequest(BaseModel):

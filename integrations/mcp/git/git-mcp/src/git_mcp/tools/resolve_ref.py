@@ -1,3 +1,4 @@
+# integrations/mcp/git/git-mcp/src/git_mcp/tools/resolve_ref.py
 from __future__ import annotations
 
 from typing import Any, Dict

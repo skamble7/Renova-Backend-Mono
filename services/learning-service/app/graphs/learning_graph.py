@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from datetime import datetime
+from typing import Any, Dict, Optional
 
 from langgraph.graph import StateGraph, END
 
-from app.graphs.nodes.ingest_node import ingest_node
-from app.graphs.nodes.load_pack_node import load_pack_node
+# Node funcs
 from app.graphs.nodes.preflight_node import preflight_node
+from app.graphs.nodes.ingest_node import ingest_node
 from app.graphs.nodes.prepare_context_node import prepare_context_node
 from app.graphs.nodes.exec_mcp_node import exec_mcp_node
 from app.graphs.nodes.exec_llm_node import exec_llm_node
@@ -15,111 +16,130 @@ from app.graphs.nodes.diff_node import diff_node
 from app.graphs.nodes.audit_node import audit_node
 from app.graphs.nodes.finalize_node import finalize_node
 
-from typing import Optional
-from pydantic import UUID4
-
-from app.clients.capability_service import CapabilityServiceClient
 from app.agents.registry import build_step_plan
+from app.clients.capability_service import CapabilityServiceClient
 from app.db.runs import mark_run_status, set_run_summary_times
 from app.models.run import LearningRun
 
 
-def build_graph(initial_state: Dict[str, Any]) -> Any:
-    """
-    Build a LangGraph with nodes wired sequentially based on the plan.
-    This compiles a graph instance per run (since steps vary per playbook).
-    """
-    # 1) static prologue
+def _step_key(step: Dict[str, Any]) -> str:
+    return str(step.get("id") or step.get("step_id") or "step")
+
+
+def build_graph(initial_state: Dict[str, Any]):
     graph = StateGraph(dict)
 
-    graph.add_node("ingest", ingest_node)
-    graph.add_node("load_pack", load_pack_node)
+    # Shared nodes
     graph.add_node("preflight", preflight_node)
-
-    # Entry point
-    graph.set_entry_point("ingest")
-    graph.add_edge("ingest", "load_pack")
-    graph.add_edge("load_pack", "preflight")
-
-    # 2) dynamically add per-step subgraph
-    # We temporarily run ingest/load_pack/preflight synchronously to know steps.
-    # For simplicity, we assume initial_state already has 'plan' (or we will patch it later).
-    # A pragmatic trick: we inspect initial_state['plan']['steps'] if present; else we add one generic slot.
-    steps = (initial_state.get("plan") or {}).get("steps") or []
-
-    last = "preflight"
-    for i, step in enumerate(steps):
-        # Within the state, we keep a moving index so nodes know which step they’re operating on.
-        def set_index_wrapper(fn, index: int):
-            async def wrapped(s: Dict[str, Any]) -> Dict[str, Any]:
-                s["_step_index"] = index
-                return await fn(s)
-            return wrapped
-
-        ctx_node = f"{step['step_id']}.ctx"
-        exec_node = f"{step['step_id']}.exec"
-        val_node = f"{step['step_id']}.validate"
-        diff_node_name = f"{step['step_id']}.diff"
-        audit_node_name = f"{step['step_id']}.audit"
-
-        graph.add_node(ctx_node, set_index_wrapper(prepare_context_node, i))
-        if step["mode"] == "mcp":
-            graph.add_node(exec_node, set_index_wrapper(exec_mcp_node, i))
-        else:
-            graph.add_node(exec_node, set_index_wrapper(exec_llm_node, i))
-        graph.add_node(val_node, set_index_wrapper(validate_node, i))
-        graph.add_node(diff_node_name, set_index_wrapper(diff_node, i))
-        graph.add_node(audit_node_name, set_index_wrapper(audit_node, i))
-
-        graph.add_edge(last, ctx_node)
-        graph.add_edge(ctx_node, exec_node)
-        graph.add_edge(exec_node, val_node)
-        graph.add_edge(val_node, diff_node_name)
-        graph.add_edge(diff_node_name, audit_node_name)
-        last = audit_node_name
-
-    # 3) finalize
+    graph.add_node("ingest", ingest_node)
+    graph.add_node("diff", diff_node)
+    graph.add_node("audit", audit_node)
     graph.add_node("finalize", finalize_node)
-    graph.add_edge(last, "finalize")
+
+    steps = (initial_state.get("plan") or {}).get("steps") or []
+    n = len(steps)
+
+    graph.set_entry_point("preflight")
+    graph.add_edge("preflight", "ingest")
+
+    if n == 0:
+        graph.add_edge("ingest", "diff")
+        graph.add_edge("diff", "audit")
+        graph.add_edge("audit", "finalize")
+        graph.add_edge("finalize", END)
+        return graph.compile()
+
+    def make_set_index_node(i: int):
+        async def _setter(state: Dict[str, Any]) -> Dict[str, Any]:
+            state["_step_index"] = i
+            return state
+        return _setter
+
+    prev_tail = "ingest"
+    for i, step in enumerate(steps):
+        skey = _step_key(step)
+        set_idx_name = f"{skey}.set"
+        ctx_name = f"{skey}.ctx"
+        exec_llm_name = f"{skey}.exec.llm"
+        exec_mcp_name = f"{skey}.exec.mcp"
+        validate_name = f"{skey}.validate"
+
+        graph.add_node(set_idx_name, make_set_index_node(i))
+        graph.add_node(ctx_name, prepare_context_node)
+        graph.add_node(exec_llm_name, exec_llm_node)
+        graph.add_node(exec_mcp_name, exec_mcp_node)
+        graph.add_node(validate_name, validate_node)
+
+        graph.add_edge(prev_tail, set_idx_name)
+        graph.add_edge(set_idx_name, ctx_name)
+
+        def mode_selector(state: Dict[str, Any]) -> str:
+            idx = state.get("_step_index", 0)
+            st = (state.get("plan") or {}).get("steps", [])
+            if 0 <= idx < len(st):
+                mode = (st[idx].get("execution_mode") or "llm").lower()
+                return "mcp" if mode == "mcp" else "llm"
+            return "llm"
+
+        graph.add_conditional_edges(
+            ctx_name,
+            mode_selector,
+            {"mcp": exec_mcp_name, "llm": exec_llm_name},
+        )
+
+        graph.add_edge(exec_mcp_name, validate_name)
+        graph.add_edge(exec_llm_name, validate_name)
+
+        prev_tail = validate_name
+
+    graph.add_edge(prev_tail, "diff")
+    graph.add_edge("diff", "audit")
+    graph.add_edge("audit", "finalize")
     graph.add_edge("finalize", END)
 
     return graph.compile()
 
 
+# ───────────────────────────────────────────────────────────────────────────────
+# Execution helpers
+# ───────────────────────────────────────────────────────────────────────────────
+
 async def _prefetch_plan(pack_id: str, playbook_id: str, correlation_id: Optional[str]) -> dict:
     """
     Fetch resolved pack and produce a normalized plan with StepPlan dicts.
+    Falls back to fetching individual capabilities if the resolved view omits `capabilities[]`.
     """
     async with CapabilityServiceClient() as caps:
         resolved = await caps.get_resolved_pack(pack_id, correlation_id=correlation_id)
 
-    # Build capability snapshot map
-    capsnaps: dict[str, dict] = {}
-    for c in resolved.get("capabilities") or []:
-        cid = c.get("id") or c.get("capability_id")
-        if cid:
-            capsnaps[str(cid)] = c
+        # Capability snapshots map (if present)
+        capsnaps: dict[str, dict] = {}
+        for c in resolved.get("capabilities") or []:
+            cid = c.get("id") or c.get("capability_id")
+            if cid:
+                capsnaps[str(cid)] = c
 
-    # Find playbook
-    playbook = next((p for p in (resolved.get("playbooks") or []) if str(p.get("id")) == playbook_id), None)
-    if not playbook:
-        raise ValueError(f"playbook not found in pack: {playbook_id}")
+        # Find playbook
+        playbook = next((p for p in (resolved.get("playbooks") or []) if str(p.get("id")) == playbook_id), None)
+        if not playbook:
+            raise ValueError(f"playbook not found in pack: {playbook_id}")
 
-    # Build step plans
-    steps_plan = []
-    for s in playbook.get("steps", []):
-        cid = str(s.get("capability_id"))
-        cap_snap = capsnaps.get(cid, {})
-        steps_plan.append(build_step_plan(s, cap_snap).__dict__)
+        # Build step plans (fallback to fetching capability when not in resolved pack)
+        steps_plan = []
+        for s in playbook.get("steps", []):
+            cid = str(s.get("capability_id"))
+            cap_snap = capsnaps.get(cid)
+            if cap_snap is None:
+                try:
+                    cap_snap = await caps.get_capability(cid, correlation_id=correlation_id)
+                except Exception:
+                    cap_snap = {}
+            steps_plan.append(build_step_plan(s, cap_snap).model_dump())
 
     return {"playbook": playbook, "steps": steps_plan}
 
 
 async def execute_run(run: LearningRun, *, correlation_id: Optional[str]) -> None:
-    """
-    Build initial state, compile the graph (with plan preloaded), and execute it.
-    Ensures run status/timestamps are set on failure as well.
-    """
     initial_state = {
         "run_id": run.run_id,
         "workspace_id": run.workspace_id,
@@ -133,27 +153,31 @@ async def execute_run(run: LearningRun, *, correlation_id: Optional[str]) -> Non
     }
 
     try:
-        # Prefetch plan so the graph can be compiled with dynamic per-step nodes
         initial_state["plan"] = await _prefetch_plan(run.pack_id, run.playbook_id, correlation_id)
         graph = build_graph(initial_state)
-        # Execute the compiled graph
+
+        try:
+            await mark_run_status(run.run_id, "running")
+            await set_run_summary_times(run.run_id, started_at=datetime.utcnow())
+        except Exception:
+            pass
+
         if hasattr(graph, "ainvoke"):
             await graph.ainvoke(initial_state)
         else:
-            # Older langgraph versions
             await graph.invoke(initial_state)  # type: ignore[attr-defined]
-    except Exception as e:
-        # Mark as failed and finalize timestamps
-        await mark_run_status(run.run_id, "failed")
-        await set_run_summary_times(run.run_id, completed_at=datetime.utcnow())
+
+    except Exception:
+        try:
+            await mark_run_status(run.run_id, "failed")
+            await set_run_summary_times(run.run_id, completed_at=datetime.utcnow())
+        except Exception:
+            pass
         raise
 
 
-async def execute_run_by_id(run_id: UUID4, *, correlation_id: Optional[str]) -> None:
-    """
-    Convenience wrapper to load a run and execute it.
-    """
-    from app.db.runs import get_run  # local import to avoid cycles
+async def execute_run_by_id(run_id, *, correlation_id: Optional[str]) -> None:
+    from app.db.runs import get_run
     run = await get_run(run_id)
     if not run:
         return

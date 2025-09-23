@@ -1,3 +1,4 @@
+# integrations/mcp/git/git-mcp/src/git_mcp/util/git_cmd.py
 from __future__ import annotations
 
 import hashlib

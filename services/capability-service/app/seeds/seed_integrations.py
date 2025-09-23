@@ -1,3 +1,4 @@
+# services/capability-service/app/seeds/seed_integrations.py
 from __future__ import annotations
 
 import logging
@@ -17,16 +18,20 @@ def _transport_str(t) -> str:
             return f"http base_url='{t.base_url}'"
     except Exception:
         pass
-    # Fallback for unknown/extended transport types
     kind = getattr(t, "kind", "unknown")
     return f"{kind}"
 
 
 async def seed_integrations() -> None:
     """
-    Reseat integrations to the NEW transport-based MCPIntegration shape.
-    - Deletes existing known IDs (old http-based + any prior variants).
-    - Creates only the new stdio-based integrations.
+    Reseat integrations to the transport-based MCPIntegration shape.
+
+    Notes:
+    - mcp.git and mcp.cobol.parser are launched via `docker run` with the
+      project root mounted at /mnt/work inside the tool containers.
+    - We DO NOT wait for a readiness banner (readiness_regex=None) because the
+      containers don’t emit a stable line. The STDIO bridge will be ready to
+      receive tool calls immediately.
     """
     log.info("[capability.seeds.integrations] Begin")
     svc = IntegrationService()
@@ -43,8 +48,7 @@ async def seed_integrations() -> None:
         "mcp.lineage.engine",
         "mcp.workflow.miner",
         "mcp.diagram.exporter",
-        # legacy id we no longer seed
-        "mcp.cobol.callgraph",
+        "mcp.cobol.callgraph",  # legacy
     ]
     for oid in delete_ids:
         try:
@@ -55,11 +59,11 @@ async def seed_integrations() -> None:
                 except AttributeError:
                     log.warning("[capability.seeds.integrations] delete() not available; could not remove %s", oid)
         except Exception:
-            # not found / other non-fatal
             pass
 
-    # 2) New stdio-based integrations (exactly per your revised seeds)
+    # 2) Define integrations
     targets = [
+        # ----- mcp.git via docker run (stdio) -----
         MCPIntegration(
             id="mcp.git",
             name="Git MCP",
@@ -67,16 +71,32 @@ async def seed_integrations() -> None:
             tags=["repo", "git", "source"],
             transport=StdioTransport(
                 kind="stdio",
-                command="git-mcp",
-                args=["--stdio"],
-                cwd="/opt/renova/tools/git",
-                env={"LOG_LEVEL": "info"},
+                command="docker",
+                args=[
+                    "run",
+                    "--rm",
+                    "-i",
+                    "-v", "${workspaceFolder}:/mnt/work",
+                    "-w", "/opt/renova/tools/git",
+                    "-e", "LOG_LEVEL=info",
+                    "-e", "REPO_WORK_ROOT=/mnt/work/.renova/src",
+                    "-e", "REPO_CACHE=/mnt/work/.renova/cache",
+                    "-e", "GIT_ALLOWED_HOSTS=github.com,git.example.com",
+                    "-e", "GIT_DISABLE_REFERENCE=1",
+                    "git-mcp:dev",
+                    "--stdio",
+                ],
+                # Launch docker from the repo root (safer if you later use relative paths)
+                cwd="${workspaceFolder}",
+                env={},            # everything the tool needs is passed into the container via -e above
                 env_aliases={},
                 restart_on_exit=True,
-                readiness_regex="mcp server ready",
+                readiness_regex=None,  # <— do not wait for a banner; start immediately
                 kill_timeout_sec=10,
             ),
         ),
+
+        # ----- mcp.cobol.parser via docker run (stdio) -----
         MCPIntegration(
             id="mcp.cobol.parser",
             name="COBOL Parser MCP",
@@ -84,16 +104,37 @@ async def seed_integrations() -> None:
             tags=["cobol", "parse", "proleap"],
             transport=StdioTransport(
                 kind="stdio",
-                command="cobol-parser-mcp",
-                args=["--stdio"],
-                cwd="/opt/renova/tools/cobol-parser",
-                env={"LOG_LEVEL": "info"},
+                command="docker",
+                args=[
+                    "run",
+                    "--rm",
+                    "-i",
+                    "-v", "${workspaceFolder}:/mnt/work",
+                    "-w", "/opt/renova/tools/cobol-parser",
+                    "-e", "LOG_LEVEL=info",
+                    "-e", "COBOL_DIALECT=COBOL85",
+                    "-e", "WORKSPACE_HOST=${workspaceFolder}",
+                    "-e", "WORKSPACE_CONTAINER=/mnt/work",
+                    # cb2xml (optional)
+                    "-e", "CB2XML_CLASSPATH=/opt/cb2xml/lib/*",
+                    "-e", "CB2XML_MAIN=net.sf.cb2xml.Cb2Xml",
+                    # ProLeap bridge
+                    "-e", "PROLEAP_CLASSPATH=/opt/proleap/lib/proleap-cli-bridge.jar",
+                    "-e", "PROLEAP_MAIN=com.renova.proleap.CLI",
+                    # debug dumps
+                    "-e", "RAW_AST_DUMP_DIR=/mnt/work/.renova/debug/raw-ast",
+                    "cobol-parser-mcp:dev",
+                ],
+                cwd="${workspaceFolder}",
+                env={},
                 env_aliases={},
                 restart_on_exit=True,
-                readiness_regex="mcp server ready",
+                readiness_regex=None,  # <— do not wait for a banner to avoid startup timeout
                 kill_timeout_sec=10,
             ),
         ),
+
+        # ----- everything else unchanged -----
         MCPIntegration(
             id="mcp.jcl.parser",
             name="JCL Parser MCP",
@@ -250,11 +291,7 @@ async def seed_integrations() -> None:
             pass
 
         await svc.create(integ, actor="seed")
-        log.info(
-            "[capability.seeds.integrations] created: %s (%s)",
-            integ.id,
-            _transport_str(integ.transport),
-        )
+        log.info("[capability.seeds.integrations] created: %s (%s)", integ.id, _transport_str(integ.transport))
         created += 1
 
     log.info("[capability.seeds.integrations] Done (created=%d)", created)

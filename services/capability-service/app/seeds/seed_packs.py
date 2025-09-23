@@ -48,26 +48,58 @@ async def _delete_pack_if_exists(svc: PackService, key: str, version: str) -> No
     log.warning("[capability.seeds.packs] Could not delete existing pack %s@%s; continuing with create()", key, version)
 
 
+async def _create_refresh_publish(svc: PackService, payload: CapabilityPackCreate, publish_on_seed: bool) -> None:
+    """
+    Helper to create, refresh snapshots, and optionally publish a pack.
+    Assumes the caller has already cleaned up any existing same-version pack if desired.
+    """
+    key = payload.key
+    version = payload.version
+
+    created = await svc.create(payload, actor="seed")
+    log.info("[capability.seeds.packs] created: %s@%s (id=%s)", key, version, getattr(created, "id", None))
+
+    refreshed = await svc.refresh_snapshots(f"{key}@{version}")
+    if refreshed:
+        log.info("[capability.seeds.packs] snapshots refreshed: %s", refreshed.id)
+    else:
+        log.warning("[capability.seeds.packs] pack not found for snapshot refresh: %s@%s", key, version)
+        return
+
+    if publish_on_seed:
+        published = await svc.publish(f"{key}@{version}", actor="seed")
+        if published:
+            log.info("[capability.seeds.packs] published: %s", published.id)
+        else:
+            log.warning("[capability.seeds.packs] publish failed or pack not found for %s@%s", key, version)
+    else:
+        log.info("[capability.seeds.packs] publish skipped via env for %s@%s", key, version)
+
+
 async def seed_packs() -> None:
     """
-    Seed ONLY the new 'cobol-mainframe@v1.0.1' pack and remove any previous
-    version of the same key (e.g., v1.0).
-    If PACK_SEED_PUBLISH=1, will publish after snapshot refresh.
+    Seed TWO capability packs under the same key 'cobol-mainframe':
+      1) v1.0.1 (existing full-flow pack) — preserved as-is.
+      2) v1.0.2 (new minimal pack) — two-step playbook: cap.repo.clone -> cap.cobol.parse.
+
+    If PACK_SEED_PUBLISH=1, both will be published after snapshot refresh.
     """
     log.info("[capability.seeds.packs] Begin")
 
     publish_on_seed = os.getenv("PACK_SEED_PUBLISH", "1") in ("1", "true", "True")
-
-    pack_key = "cobol-mainframe"
-    pack_version = "v1.0.1"
-
     svc = PackService()
 
-    # Remove old pack version(s) for a clean slate (explicitly v1.0 if it exists)
-    await _delete_pack_if_exists(svc, pack_key, "v1.0")
-    await _delete_pack_if_exists(svc, pack_key, pack_version)  # ensure idempotency on re-run
+    pack_key = "cobol-mainframe"
+    full_version = "v1.0.1"   # existing full pack (unchanged)
+    mini_version = "v1.0.2"   # new derived minimal pack
 
-    # Build the new playbook exactly as specified
+    # -------------------------------
+    # Pack #1: Full-flow v1.0.1 (UNCHANGED)
+    # -------------------------------
+    # Do NOT delete v1.0.1 unless we're re-seeding the exact same version for idempotency.
+    # We only remove the same version if present to allow updates in a controlled re-run.
+    await _delete_pack_if_exists(svc, pack_key, full_version)
+
     pb_main = Playbook(
         id="pb.main",
         name="Main COBOL Learning Flow",
@@ -153,9 +185,9 @@ async def seed_packs() -> None:
         ],
     )
 
-    payload = CapabilityPackCreate(
+    payload_full = CapabilityPackCreate(
         key=pack_key,
-        version=pack_version,
+        version=full_version,
         title="COBOL Mainframe Modernization",
         description="Deterministic MCP parsing + LLM enrichment to discover inventories, data lineage, and workflows from COBOL/JCL estates.",
         capability_ids=[
@@ -174,26 +206,48 @@ async def seed_packs() -> None:
         playbooks=[pb_main],
     )
 
-    # Create the new pack
-    created = await svc.create(payload, actor="seed")
-    log.info("[capability.seeds.packs] created: %s@%s (id=%s)", pack_key, pack_version, getattr(created, "id", None))
+    await _create_refresh_publish(svc, payload_full, publish_on_seed)
 
-    # (Re)build snapshots from current capability docs
-    refreshed = await svc.refresh_snapshots(f"{pack_key}@{pack_version}")
-    if refreshed:
-        log.info("[capability.seeds.packs] snapshots refreshed: %s", refreshed.id)
-    else:
-        log.warning("[capability.seeds.packs] pack not found for snapshot refresh")
-        return
+    # -------------------------------
+    # Pack #2: Minimal two-step v1.0.2 (NEW)
+    # -------------------------------
+    # Only delete same-version (v1.0.2) for idempotent reseeding; DO NOT touch v1.0.1.
+    await _delete_pack_if_exists(svc, pack_key, mini_version)
 
-    # Optional publish
-    if publish_on_seed:
-        published = await svc.publish(f"{pack_key}@{pack_version}", actor="seed")
-        if published:
-            log.info("[capability.seeds.packs] published: %s", published.id)
-        else:
-            log.warning("[capability.seeds.packs] publish failed or pack not found")
-    else:
-        log.info("[capability.seeds.packs] publish skipped via env")
+    pb_core = Playbook(
+        id="pb.core",
+        name="Core Clone + Parse",
+        description="Minimal flow to clone a repo and parse COBOL sources.",
+        steps=[
+            PlaybookStep(
+                id="s1.clone",
+                name="Clone Repo",
+                capability_id="cap.repo.clone",
+                description="Clone source repository; records commit and paths_root.",
+                params={"url": "${git.url}", "branch": "${git.branch:-main}", "depth": 0, "dest": "${repo.dest:-/mnt/src}"},
+            ),
+            PlaybookStep(
+                id="s2.cobol",
+                name="Parse COBOL",
+                capability_id="cap.cobol.parse",
+                description="ProLeap/cb2xml parse of programs and copybooks into normalized CAM kinds.",
+                params={"root": "${repo.paths_root}", "paths": [], "dialect": "COBOL85"},
+            ),
+        ],
+    )
 
-    log.info("[capability.seeds.packs] Done")
+    payload_mini = CapabilityPackCreate(
+        key=pack_key,
+        version=mini_version,
+        title="COBOL Mainframe Modernization (Core)",
+        description="Derived minimal pack with a two-step playbook: clone repo then parse COBOL.",
+        capability_ids=[
+            "cap.repo.clone",
+            "cap.cobol.parse",
+        ],
+        playbooks=[pb_core],
+    )
+
+    await _create_refresh_publish(svc, payload_mini, publish_on_seed)
+
+    log.info("[capability.seeds.packs] Done (seeded %s@%s and %s@%s)", pack_key, full_version, pack_key, mini_version)

@@ -4,52 +4,51 @@ import asyncio
 import json
 import os
 import re
-import sys
 import uuid
+import logging
 from asyncio.subprocess import Process
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger("app.transport.stdio")
 
 
 class StdioTransport:
     """
     Persistent STDIO transport using a simple JSON-RPC 2.0 over newline-delimited frames.
-
-    Contract expectations (from integration snapshot):
-      transport.kind = "stdio"
-      transport.command : str
-      transport.args? : list[str]
-      transport.cwd? : str
-      transport.env? : dict[str,str] (static, non-secret)
-      transport.env_aliases? : dict[str,str] (key -> alias name; resolved via secret_resolver or env var)
-      transport.restart_on_exit? : bool
-      transport.readiness_regex? : str (waits for a matching line on stdout)
-      transport.kill_timeout_sec? : int
-
-    Invocation protocol (assumed default):
-      Send:   {"jsonrpc":"2.0","id":"<uuid>","method":"<tool>","params":{...}}\n
-      Expect: {"jsonrpc":"2.0","id":"<uuid>","result": ... }   OR   {"error": {...}}
-
-    If your server uses a different framing, adapt `_send_and_recv`.
     """
 
-    def __init__(self, integration_snapshot: Dict[str, Any], *, secret_resolver=None) -> None:
+    def __init__(self, integration_snapshot: Dict[str, Any], *, secret_resolver=None, runtime_vars: Optional[Dict[str, Any]] = None) -> None:
         self.snapshot = integration_snapshot or {}
         t = self.snapshot.get("transport") or {}
-        self.command: str = t.get("command") or ""
+        self._runtime_vars = runtime_vars or {}
+
+        def subst(val):
+            if not isinstance(val, str):
+                return val
+            out = val
+            for k, v in self._runtime_vars.items():
+                out = out.replace(f"${{{k}}}", str(v))
+            return out
+
+        self.command: str = subst(t.get("command") or "")
         if not self.command:
             raise ValueError("StdioTransport requires transport.command")
-        self.args = list(t.get("args") or [])
-        self.cwd = t.get("cwd") or None
-        self.static_env = dict(t.get("env") or {})
+        self.args = [subst(a) for a in (t.get("args") or [])]
+        self.cwd = subst(t.get("cwd") or None)
+        self.static_env = {k: subst(v) for k, v in (t.get("env") or {}).items()}
         self.env_aliases = dict(t.get("env_aliases") or {})
         self.restart_on_exit = bool(t.get("restart_on_exit", True))
-        self.readiness_regex = t.get("readiness_regex") or None
+        self.readiness_regex = subst(t.get("readiness_regex") or None)
         self.kill_timeout_sec = int(t.get("kill_timeout_sec") or os.getenv("MCP_STDIO_KILL_TIMEOUT", "10"))
         self.startup_timeout_sec = int(os.getenv("MCP_STDIO_STARTUP_TIMEOUT", "20"))
 
         self._proc: Optional[Process] = None
-        self._reader_task: Optional[asyncio.Task] = None
-        self._buffer = asyncio.Queue()  # lines from stdout
+        self._stdout_reader_task: Optional[asyncio.Task] = None
+        self._stderr_reader_task: Optional[asyncio.Task] = None
+
+        self._resp_q: asyncio.Queue[str] = asyncio.Queue()
+        self._ready_q: asyncio.Queue[str] = asyncio.Queue()
+
         self._lock = asyncio.Lock()
         self._secret_resolver = secret_resolver
 
@@ -60,7 +59,7 @@ class StdioTransport:
         env = os.environ.copy()
         env.update(self.static_env)
 
-        # Resolve aliases: values are alias names that map to secret strings via resolver or env
+        # Resolve env aliases
         for key, alias in self.env_aliases.items():
             val = None
             if self._secret_resolver:
@@ -69,6 +68,8 @@ class StdioTransport:
                 val = os.getenv(alias)
             if val is not None:
                 env[key] = val
+
+        logger.info("STDIO: launching command=%s args=%s cwd=%s", self.command, self.args, self.cwd)
 
         self._proc = await asyncio.create_subprocess_exec(
             self.command,
@@ -80,43 +81,65 @@ class StdioTransport:
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Start reader task to continuously read stdout lines
-        assert self._proc.stdout is not None
-        self._reader_task = asyncio.create_task(self._reader(self._proc.stdout))
+        assert self._proc.stdout is not None and self._proc.stderr is not None
+        self._stdout_reader_task = asyncio.create_task(self._reader_stdout(self._proc.stdout))
+        self._stderr_reader_task = asyncio.create_task(self._reader_stderr(self._proc.stderr))
 
-        # Optionally wait for readiness
         if self.readiness_regex:
             pattern = re.compile(self.readiness_regex)
             try:
-                await asyncio.wait_for(self._wait_for_output(pattern), timeout=self.startup_timeout_sec)
+                await asyncio.wait_for(self._wait_for_ready(pattern), timeout=self.startup_timeout_sec)
+                logger.info("STDIO: readiness matched pattern=%s", self.readiness_regex)
             except asyncio.TimeoutError:
                 await self.aclose()
                 raise RuntimeError("STDIO transport readiness timed out")
 
-    async def _reader(self, stream: asyncio.StreamReader) -> None:
+    async def _reader_stdout(self, stream: asyncio.StreamReader) -> None:
         try:
             while True:
-                line = await stream.readline()
-                if not line:
+                line_bytes = await stream.readline()
+                if not line_bytes:
                     break
+                line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
                 try:
-                    self._buffer.put_nowait(line.decode("utf-8", errors="replace").rstrip("\r\n"))
+                    self._ready_q.put_nowait(line)
                 except Exception:
-                    # If buffer is full or closed, drop line silently
+                    pass
+                try:
+                    self._resp_q.put_nowait(line)
+                except Exception:
                     pass
         except Exception:
             pass
 
-    async def _wait_for_output(self, pattern: re.Pattern[str]) -> None:
+    async def _reader_stderr(self, stream: asyncio.StreamReader) -> None:
+        try:
+            while True:
+                line_bytes = await stream.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+                try:
+                    self._ready_q.put_nowait(line)
+                except Exception:
+                    pass
+                logger.debug("STDIO[stderr]: %s", line)
+        except Exception:
+            pass
+
+    async def _wait_for_ready(self, pattern: re.Pattern[str]) -> None:
         while True:
-            line = await self._buffer.get()
+            line = await self._ready_q.get()
             if pattern.search(line):
                 return
 
     async def aclose(self) -> None:
-        if self._reader_task:
-            self._reader_task.cancel()
-            self._reader_task = None
+        for task in (self._stdout_reader_task, self._stderr_reader_task):
+            if task:
+                task.cancel()
+        self._stdout_reader_task = None
+        self._stderr_reader_task = None
+
         if self._proc:
             try:
                 if self._proc.stdin:
@@ -140,7 +163,7 @@ class StdioTransport:
         args: Dict[str, Any],
         *,
         timeout_sec: Optional[float] = None,
-        correlation_id: Optional[str] = None,  # not used in stdio, but kept for symmetry
+        correlation_id: Optional[str] = None,
     ) -> Any:
         await self._ensure_connected()
         assert self._proc is not None and self._proc.stdin is not None
@@ -152,10 +175,12 @@ class StdioTransport:
             ensure_ascii=False,
         ) + "\n"
 
+        logger.info("STDIO: send tool=%s timeout=%s args.keys=%s", tool, timeout_sec, list(args.keys())[:8])
+
         async with self._lock:
             self._proc.stdin.write(frame.encode("utf-8"))
             await self._proc.stdin.drain()
-            # Wait for a matching response line
+
             deadline = asyncio.get_event_loop().time() + (timeout_sec or 60.0)
             while True:
                 timeout = deadline - asyncio.get_event_loop().time()
@@ -163,19 +188,16 @@ class StdioTransport:
                     raise TimeoutError(f"STDIO tool call timed out: {tool}")
 
                 try:
-                    line = await asyncio.wait_for(self._buffer.get(), timeout=timeout)
+                    line = await asyncio.wait_for(self._resp_q.get(), timeout=timeout)
                 except asyncio.TimeoutError:
                     raise TimeoutError(f"STDIO tool call timed out: {tool}")
 
                 try:
                     obj = json.loads(line)
                 except Exception:
-                    # Not a JSON line; ignore
                     continue
 
                 if obj.get("id") != req_id:
-                    # Not our response; re-queue or drop
-                    # (Dropping to keep it simple; servers should reply in order)
                     continue
 
                 if "error" in obj:

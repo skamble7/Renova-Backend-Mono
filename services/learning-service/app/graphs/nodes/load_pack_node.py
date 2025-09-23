@@ -10,6 +10,10 @@ async def load_pack_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Loads the resolved pack, extracts the requested playbook, and builds a normalized execution plan.
     Outputs into state['plan'] = { 'steps': [StepPlan dicts], 'playbook': {...} }
+
+    Defensive behaviors:
+    - Some resolved-pack views may omit `capabilities[]`. If so, we fetch each capability by id as fallback.
+    - Step-level `integration` / `tool_calls` (when present) will be honored.
     """
     pack_id: str = state["pack_id"]
     playbook_id: str = state["playbook_id"]
@@ -18,25 +22,32 @@ async def load_pack_node(state: Dict[str, Any]) -> Dict[str, Any]:
     async with CapabilityServiceClient() as caps:
         resolved = await caps.get_resolved_pack(pack_id, correlation_id=correlation_id)
 
-    # Find the playbook and its steps
-    playbooks: List[Dict[str, Any]] = list(resolved.get("playbooks") or [])
-    playbook = next((p for p in playbooks if str(p.get("id")) == playbook_id), None)
-    if not playbook:
-        raise ValueError(f"playbook not found in pack: {playbook_id}")
+        # Find the playbook and its steps
+        playbooks: List[Dict[str, Any]] = list(resolved.get("playbooks") or [])
+        playbook = next((p for p in playbooks if str(p.get("id")) == playbook_id), None)
+        if not playbook:
+            raise ValueError(f"playbook not found in pack: {playbook_id}")
 
-    # Cap snapshots are expected either on the pack root or resolved per step.
-    # Build a map for quick lookup:
-    capsnaps: Dict[str, Dict[str, Any]] = {}
-    for c in resolved.get("capabilities") or []:
-        cid = c.get("id") or c.get("capability_id")
-        if cid:
-            capsnaps[str(cid)] = c
+        # Build a capability snapshot map if provided in resolved pack
+        capsnaps: Dict[str, Dict[str, Any]] = {}
+        for c in resolved.get("capabilities") or []:
+            cid = c.get("id") or c.get("capability_id")
+            if cid:
+                capsnaps[str(cid)] = c
 
-    steps_plan = []
-    for s in playbook.get("steps", []):
-        cid = str(s.get("capability_id"))
-        cap_snap = capsnaps.get(cid, {})
-        steps_plan.append(build_step_plan(s, cap_snap))
+        steps_plan = []
+        for s in playbook.get("steps", []):
+            cid = str(s.get("capability_id"))
 
-    state["plan"] = {"playbook": playbook, "steps": [sp.__dict__ for sp in steps_plan]}
+            # Fallback: fetch the capability snapshot if not present on resolved pack
+            cap_snap = capsnaps.get(cid)
+            if cap_snap is None:
+                try:
+                    cap_snap = await caps.get_capability(cid, correlation_id=correlation_id)
+                except Exception:
+                    cap_snap = {}
+
+            steps_plan.append(build_step_plan(s, cap_snap).model_dump())
+
+    state["plan"] = {"playbook": playbook, "steps": steps_plan}
     return state

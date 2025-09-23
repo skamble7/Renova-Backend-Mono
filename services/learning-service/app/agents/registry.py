@@ -1,48 +1,70 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Literal
+from pydantic import BaseModel, Field
 
-from app.agents.spi import StepPlan
+
+class StepPlan(BaseModel):
+    id: str
+    name: str
+    capability_id: str
+
+    # Decides which executor node is used
+    execution_mode: Literal["mcp", "llm"] = "llm"
+
+    # Flattened for convenience during execution
+    produces_kinds: List[str] = Field(default_factory=list)
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+    # Keep the full snapshot handy (integration/llm_config/etc.)
+    capability_snapshot: Dict[str, Any] = Field(default_factory=dict)
 
 
-def _execution_mode(cap_snap: Dict[str, Any]) -> Literal["mcp", "llm"]:
+def build_step_plan(step: Dict[str, Any], cap_snapshot: Dict[str, Any]) -> StepPlan:
     """
-    Decide whether a capability snapshot runs via MCP or LLM.
+    Normalize a playbook step + its capability snapshot into a StepPlan the graph uses.
+
+    Robust execution mode selection:
+      1) If step.execution_mode is explicitly set -> use it.
+      2) Else if step.tool_calls present -> MCP.
+      3) Else if capability.integration.tool_calls present -> MCP.
+      4) Else if capability.integration present -> MCP (tools may be implicit).
+      5) Else -> LLM (if llm_config present) or default to LLM.
     """
-    integration = (cap_snap or {}).get("integration") or {}
-    llm_cfg = (cap_snap or {}).get("llm_config") or {}
-    if integration:
-        return "mcp"
-    if llm_cfg:
-        return "llm"
-    # Fallback: if neither declared, default to LLM to allow reasoning
-    return "llm"
+    cap = cap_snapshot or {}
+    integration = (cap.get("integration") or {})
+    llm_config = cap.get("llm_config") or None
 
+    # Sources of tool calls (resolved packs may place these at step or capability)
+    tool_calls_step = list(step.get("tool_calls") or [])
+    tool_calls_cap = list((integration.get("tool_calls") or []))
 
-def _produces_kinds(cap_snap: Dict[str, Any]) -> List[str]:
-    return list((cap_snap or {}).get("produces_kinds") or [])
+    produces = list(step.get("produces_kinds") or cap.get("produces_kinds") or [])
 
+    # Decide execution mode (no hard failure here; exec node will resolve/fetch integration if needed)
+    explicit_mode = (step.get("execution_mode") or "").lower()
+    if explicit_mode in ("mcp", "llm"):
+        mode = explicit_mode
+    elif tool_calls_step:
+        mode = "mcp"
+    elif tool_calls_cap:
+        mode = "mcp"
+    elif integration:
+        mode = "mcp"
+    else:
+        mode = "llm" if llm_config else "llm"
 
-def _tool_calls(cap_snap: Dict[str, Any]) -> List[Dict[str, Any]]:
-    integration = (cap_snap or {}).get("integration") or {}
-    return list(integration.get("tool_calls") or [])
+    # Final tool_calls on the step plan (prefer step-level, then capability-level)
+    tool_calls = tool_calls_step or tool_calls_cap
 
-
-def build_step_plan(step_def: Dict[str, Any], cap_snap: Dict[str, Any]) -> StepPlan:
-    """
-    Create a normalized StepPlan consumers can rely on.
-    `step_def` is the playbook step from the pack (id, name, capability_id, params?).
-    `cap_snap` is the matching capability snapshot included in the resolved pack.
-    """
-    mode = _execution_mode(cap_snap)
-    kinds = _produces_kinds(cap_snap)
-    tool_calls = _tool_calls(cap_snap) if mode == "mcp" else []
     return StepPlan(
-        step_id=str(step_def.get("id")),
-        name=str(step_def.get("name") or step_def.get("id")),
-        capability_id=str(step_def.get("capability_id")),
-        mode=mode,
-        produces_kinds=kinds,
+        id=str(step.get("id") or step.get("step_id") or ""),
+        name=str(step.get("name") or step.get("id") or step.get("step_id") or ""),
+        capability_id=str(step.get("capability_id") or ""),
+        execution_mode=mode,
+        produces_kinds=produces,
         tool_calls=tool_calls,
-        capability_snapshot=cap_snap,
+        params=dict(step.get("params") or {}),
+        capability_snapshot=cap_snapshot,
     )

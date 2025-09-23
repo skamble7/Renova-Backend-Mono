@@ -66,7 +66,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="clone_repo",
                         output_kinds=["cam.asset.repo_snapshot"],
-                        timeout_sec=60,
+                        timeout_sec=300,
                         retries=1,
                     )
                 ],
@@ -83,7 +83,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="index_sources",
                         output_kinds=["cam.asset.source_file"],
-                        timeout_sec=60,
+                        timeout_sec=300,
                         retries=1,
                     )
                 ],
@@ -100,7 +100,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="parse_tree",
                         output_kinds=["cam.cobol.program", "cam.cobol.copybook"],
-                        timeout_sec=120,
+                        timeout_sec=300,
                         retries=1,
                     )
                 ],
@@ -117,7 +117,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="parse_jcl",
                         output_kinds=["cam.jcl.job", "cam.jcl.step"],
-                        timeout_sec=60,
+                        timeout_sec=300,
                         retries=1,
                     )
                 ],
@@ -134,7 +134,7 @@ async def seed_capabilities() -> None:
                     MCPToolCallSpec(
                         tool="list_transactions",
                         output_kinds=["cam.cics.transaction"],
-                        timeout_sec=60,
+                        timeout_sec=300,
                         retries=1,
                     )
                 ],
