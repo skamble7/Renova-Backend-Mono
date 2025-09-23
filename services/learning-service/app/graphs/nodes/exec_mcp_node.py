@@ -195,8 +195,6 @@ def _extract_artifacts(result: Any) -> List[Dict[str, Any]]:
     if isinstance(result, list):
         for el in result:
             if isinstance(el, dict):
-                # Either an artifact object or a container of artifacts
-                # Quick check: if it looks like an artifact, collect directly.
                 if any(k in el for k in ("kind", "kind_id", "kindId")):
                     arts.append(el)
                 else:
@@ -324,7 +322,7 @@ async def _resolve_integration_snapshot(
 
 
 def _args_preview(args: Dict[str, Any]) -> Dict[str, Any]:
-    keys = {"url", "branch", "revision", "dest", "root", "paths", "dialect", "allow_missing_kinds"}
+    keys = {"url", "branch", "revision", "dest", "root", "paths", "dialect", "allow_missing_kinds", "start_at", "file_limit", "budget_seconds"}
     preview: Dict[str, Any] = {}
     for k, v in args.items():
         if k in keys or isinstance(v, (str, int, float, bool)):
@@ -362,6 +360,47 @@ def _filter_args_by_schema(schema: dict, args: dict) -> dict:
         return dict(args)
     allowed = set(props.keys())
     return {k: v for k, v in args.items() if k in allowed}
+
+
+# ---------- pagination helpers (lossless) ----------
+
+def _extract_continuation(container: Any) -> Optional[Dict[str, Any]]:
+    """
+    Supports multiple shapes:
+      - result["continuation"] = {...}
+      - result["structuredContent"]["continuation"]
+      - snake_case variants
+    Returns a dict like {"has_more": bool, "next": int, "remaining": int, "total": int}
+    """
+    if not isinstance(container, dict):
+        return None
+    candidate = None
+
+    # direct
+    if isinstance(container.get("continuation"), dict):
+        candidate = container["continuation"]
+
+    # unwrap common wrappers
+    if not candidate:
+        sc = container.get("structuredContent") or container.get("structured_content")
+        if isinstance(sc, dict) and isinstance(sc.get("continuation"), dict):
+            candidate = sc["continuation"]
+
+    if isinstance(candidate, dict):
+        # normalize keys
+        return {
+            "has_more": bool(candidate.get("has_more") if "has_more" in candidate else candidate.get("hasMore", False)),
+            "next": int(candidate.get("next", 0)),
+            "remaining": int(candidate.get("remaining", 0)),
+            "total": int(candidate.get("total", 0)),
+        }
+    return None
+
+
+def _with_start_at(args: Dict[str, Any], start_at: int) -> Dict[str, Any]:
+    new_args = dict(args or {})
+    new_args["start_at"] = int(start_at)
+    return new_args
 
 
 async def exec_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -435,77 +474,118 @@ async def exec_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 step_id, tool, retries, timeout_sec, _args_preview(args),
             )
 
-            t0 = time.perf_counter()
-            error: Optional[str] = None
-            produced = 0
-            kinds: List[str] = []
+            total_produced_for_call = 0
+            kinds_seen: List[str] = []
+            page_index = 0
             zero_warned = False
+            last_error: Optional[str] = None
 
-            try:
-                out = await inv.call_tool(tool, args, timeout_sec=timeout_sec, retries=retries, correlation_id=correlation_id)
+            # -------- Lossless pagination loop --------
+            # Keep calling while the tool reports continuation.has_more == True.
+            next_args = dict(args)
+            while True:
+                page_index += 1
+                t0 = time.perf_counter()
+                error: Optional[str] = None
+                produced_this_page = 0
+                page_kinds: List[str] = []
 
-                logger.info("MCP(raw): step=%s tool=%s out=%s", step_id, tool, _short_json(out))
-
-                maybe = _maybe_unwrap_result(out)
-                if isinstance(maybe, dict) and maybe.get("isError") is True:
-                    raise RuntimeError(_mcp_error_text(maybe))
-
-                raw_items = _extract_artifacts(out)
-                if not raw_items and isinstance(maybe, dict) and not zero_warned:
-                    zero_warned = True
-                    logger.warning(
-                        "MCP(extract): step=%s tool=%s produced 0 artifacts; top-level keys=%s",
-                        step_id, tool, _collect_top_keys(maybe),
-                    )
-
-                items = _normalize_artifacts(raw_items)
-                items = _dedupe_artifacts(items)
-
-                produced = len(items)
-                kinds = [i.get("kind_id") or "" for i in items]
-                logger.info("MCP(result): step=%s tool=%s produced=%d kinds=%s", step_id, tool, produced, kinds)
-
-                _merge_items_into_context(ctx, items)
-                _update_repo_hints(state, items)
-                results.extend(items)
-
-                base_vars = dict(runtime_vars)
-                _flatten("", inputs, base_vars)
-                if isinstance(state.get("_hints"), dict):
-                    base_vars.update(state["_hints"])  # type: ignore[index]
-                _inject_context_vars(base_vars, ctx)
-
-            except Exception as e:  # pragma: no cover
-                error = str(e)
-                logger.exception("MCP(tool) FAILED: step=%s tool=%s error=%s", step_id, tool, error)
-
-            dur_ms = int((time.perf_counter() - t0) * 1000)
-            call_audit = {
-                "tool": tool,
-                "args": _args_preview(args),
-                "duration_ms": dur_ms,
-                "produced_count": produced,
-                "error": error,
-            }
-            state["_audit_calls"].append(call_audit)
-
-            if append_audit_entry:
                 try:
-                    await append_audit_entry(
-                        state["run_id"],
-                        {
-                            "step_id": step_id,
-                            "capability_id": step.get("capability_id"),
-                            "mode": "mcp",
-                            "inputs_preview": {"inputs": {}, "context_keys": list((ctx or {}).keys())},
-                            "calls": [call_audit],
-                        },
-                    )
-                except Exception:
-                    pass
+                    out = await inv.call_tool(tool, next_args, timeout_sec=timeout_sec, retries=retries, correlation_id=correlation_id)
 
-            if error:
-                raise RuntimeError(error)
+                    logger.info("MCP(raw): step=%s tool=%s out=%s", step_id, tool, _short_json(out))
+
+                    maybe = _maybe_unwrap_result(out)
+                    if isinstance(maybe, dict) and maybe.get("isError") is True:
+                        raise RuntimeError(_mcp_error_text(maybe))
+
+                    raw_items = _extract_artifacts(out)
+                    if not raw_items and isinstance(maybe, dict) and not zero_warned:
+                        zero_warned = True
+                        logger.warning(
+                            "MCP(extract): step=%s tool=%s produced 0 artifacts; top-level keys=%s",
+                            step_id, tool, _collect_top_keys(maybe),
+                        )
+
+                    items = _normalize_artifacts(raw_items)
+                    items = _dedupe_artifacts(items)
+
+                    produced_this_page = len(items)
+                    total_produced_for_call += produced_this_page
+                    page_kinds = [i.get("kind_id") or "" for i in items]
+                    kinds_seen.extend(page_kinds)
+
+                    logger.info(
+                        "MCP(result): step=%s tool=%s page=%d produced=%d kinds=%s",
+                        step_id, tool, page_index, produced_this_page, page_kinds,
+                    )
+
+                    _merge_items_into_context(ctx, items)
+                    _update_repo_hints(state, items)
+                    results.extend(items)
+
+                    # prepare next page if any
+                    cont = _extract_continuation(maybe if isinstance(maybe, dict) else {})
+                    if cont and cont.get("has_more"):
+                        next_offset = int(cont.get("next", 0))
+                        next_args = _with_start_at(args, next_offset)
+                        # loop continues
+                    else:
+                        break  # no continuation -> exit loop
+
+                except Exception as e:  # pragma: no cover
+                    error = str(e)
+                    last_error = error
+                    logger.exception("MCP(tool) FAILED: step=%s tool=%s page=%d error=%s", step_id, tool, page_index, error)
+                    # If a page fails, stop paginating to avoid infinite retries here.
+                    break
+
+                finally:
+                    dur_ms = int((time.perf_counter() - t0) * 1000)
+                    call_audit = {
+                        "tool": tool,
+                        "args": _args_preview(next_args),
+                        "duration_ms": dur_ms,
+                        "produced_count": produced_this_page,
+                        "page_index": page_index,
+                        "error": error,
+                    }
+                    state["_audit_calls"].append(call_audit)
+
+                    if append_audit_entry:
+                        try:
+                            await append_audit_entry(
+                                state["run_id"],
+                                {
+                                    "step_id": step_id,
+                                    "capability_id": step.get("capability_id"),
+                                    "mode": "mcp",
+                                    "inputs_preview": {"inputs": {}, "context_keys": list((ctx or {}).keys())},
+                                    "calls": [call_audit],
+                                },
+                            )
+                        except Exception:
+                            pass
+
+                    if error:
+                        # Bubble the last error after auditing
+                        raise RuntimeError(error)
+
+                # refresh interpolation variables for next page (repo hints may have changed)
+                new_base = dict(runtime_vars)
+                _flatten("", inputs, new_base)
+                if isinstance(state.get("_hints"), dict):
+                    new_base.update(state["_hints"])  # type: ignore[index]
+                _inject_context_vars(new_base, ctx)
+                # keep original 'args' as baseline; we only override start_at for the next page
+                base_vars = new_base  # noqa: F841  # (kept for parity with earlier flow)
+
+            # END pagination while-True
+
+            # After all pages of this tool call
+            if last_error:
+                # Shouldn’t happen because we raise inside the loop, but double-guard.
+                raise RuntimeError(last_error)
 
     state["last_output"] = results
     state["last_stats"] = {"produced_total": len(results)}
