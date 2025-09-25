@@ -49,7 +49,7 @@ class Settings:
             mongo_uri=os.getenv("MONGO_URI", "mongodb://localhost:27017"),
             mongo_db=os.getenv("MONGO_DB", "renova"),
 
-            rabbitmq_uri=os.getenv("RABBITMQ_URI", "amqp://guest:guest@localhost:5672/"),
+            rabbitmq_uri=os.getenv("RABBITMQ_URI", "amqp://raina:raina@host.docker.internal:5672/"),
             rabbitmq_exchange=os.getenv("RABBITMQ_EXCHANGE", "raina.events"),
             events_org=os.getenv("EVENTS_ORG", "renova"),
 

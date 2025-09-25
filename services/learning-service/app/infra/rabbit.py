@@ -27,7 +27,7 @@ class RabbitBus:
 
     Usage:
         bus = await get_bus().connect()
-        await bus.publish(service="learning", event="run.started", payload={...})
+        await bus.publish(service="learning", event="started", payload={...})
     """
 
     def __init__(self) -> None:
@@ -75,7 +75,7 @@ class RabbitBus:
         Publish a single event to the topic exchange.
 
         :param service: logical service scope, e.g. "learning"
-        :param event: event name, e.g. "run.started"
+        :param event: event name, e.g. "started" or "step.completed"
         :param payload: JSON-serializable payload
         :param version: version segment for RK (default "v1")
         :param org: org/tenant segment; defaults to EVENTS_ORG
@@ -104,3 +104,30 @@ def get_bus() -> RabbitBus:
     if _bus is None:
         _bus = RabbitBus()
     return _bus
+
+
+# ─────────────────────────────────────────────────────────────
+# Convenience helpers (align with discovery-service style)
+# ─────────────────────────────────────────────────────────────
+
+async def publish_event_v1(*, event: str, payload: dict, headers: Optional[Dict[str, Any]] = None, org: Optional[str] = None) -> None:
+    """
+    Publish a versioned learning event:
+        <org>.learning.<event>.v1
+
+    Examples:
+        await publish_event_v1(event="started", payload={...})
+        await publish_event_v1(event="step.completed", payload={...})
+    """
+    await get_bus().publish(service="learning", event=event, payload=payload, version="v1", org=org, headers=headers or {})
+
+
+async def publish_step_event_v1(*, status: str, payload: dict, headers: Optional[Dict[str, Any]] = None, org: Optional[str] = None) -> None:
+    """
+    Publish both the generic 'step' event and the specific 'step.<status>' event.
+    """
+    # Ensure status in payload for the generic 'step'
+    enriched = dict(payload)
+    enriched["status"] = status
+    await publish_event_v1(event="step", payload=enriched, headers=headers, org=org)
+    await publish_event_v1(event=f"step.{status}", payload=payload, headers=headers, org=org)

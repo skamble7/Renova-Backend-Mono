@@ -22,6 +22,8 @@ from app.agents.registry import build_step_plan
 from app.clients.capability_service import CapabilityServiceClient
 from app.db.runs import mark_run_status, set_run_summary_times
 from app.models.run import LearningRun
+from app.infra.rabbit import publish_event_v1
+from app.models.events import LearningRunFailed
 
 
 def _step_key(step: Dict[str, Any]) -> str:
@@ -37,7 +39,6 @@ def build_graph(initial_state: Dict[str, Any]):
     graph.add_node("diff", diff_node)
     graph.add_node("audit", audit_node)
     graph.add_node("finalize", finalize_node)
-    # ❌ DO NOT reference gate_name here (it’s created per-step inside the loop)
 
     steps = (initial_state.get("plan") or {}).get("steps") or []
     n = len(steps)
@@ -156,6 +157,8 @@ async def execute_run(run: LearningRun, *, correlation_id: Optional[str]) -> Non
         "options": run.options.model_dump() if hasattr(run.options, "model_dump") else dict(run.options or {}),
         "correlation_id": correlation_id,
         "input_fingerprint": run.input_fingerprint,
+        "title": getattr(run, "title", None),
+        "description": getattr(run, "description", None),
     }
 
     try:
@@ -173,7 +176,28 @@ async def execute_run(run: LearningRun, *, correlation_id: Optional[str]) -> Non
         else:
             await graph.invoke(initial_state)  # type: ignore[attr-defined]
 
-    except Exception:
+    except Exception as e:
+        # Publish run.failed event
+        try:
+            payload = LearningRunFailed(
+                run_id=run.run_id,
+                workspace_id=run.workspace_id,
+                error=str(e),
+                logs=[],
+                errors=[],
+                artifact_failures=[],
+                started_at=None,
+                strategy=run.strategy,
+                title=getattr(run, "title", None),
+                description=getattr(run, "description", None),
+            ).model_dump(mode="json")
+            headers = {}
+            if correlation_id:
+                headers["x-correlation-id"] = correlation_id
+            await publish_event_v1(event="failed", payload=payload, headers=headers)
+        except Exception:
+            pass
+
         try:
             await mark_run_status(run.run_id, "failed")
             await set_run_summary_times(run.run_id, completed_at=datetime.utcnow())

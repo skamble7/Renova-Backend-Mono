@@ -6,10 +6,13 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.integrations import IntegrationInvoker
 from app.clients.capability_service import CapabilityServiceClient
+from app.infra.rabbit import publish_step_event_v1
+from app.models.events import LearningStepFailed, StepInfo
 
 logger = logging.getLogger("app.exec.mcp")
 
@@ -408,186 +411,199 @@ async def exec_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
     step = (state["plan"]["steps"])[idx]
     step_id = step.get("id") or f"step{idx+1}"
 
-    cap = step.get("capability_snapshot") or {}
-    cap_integration = (cap or {}).get("integration") or {}
-    step_integration = step.get("integration") or {}
-    capability_id = step.get("capability_id")
-    correlation_id = state.get("correlation_id")
+    try:
+        cap = step.get("capability_snapshot") or {}
+        cap_integration = (cap or {}).get("integration") or {}
+        step_integration = step.get("integration") or {}
+        capability_id = step.get("capability_id")
+        correlation_id = state.get("correlation_id")
 
-    snapshot = await _resolve_integration_snapshot(
-        step_integration=step_integration,
-        cap_integration=cap_integration,
-        capability_id=capability_id,
-        correlation_id=correlation_id,
-    )
+        snapshot = await _resolve_integration_snapshot(
+            step_integration=step_integration,
+            cap_integration=cap_integration,
+            capability_id=capability_id,
+            correlation_id=correlation_id,
+        )
 
-    workspace_folder = (
-        (state.get("options") or {}).get("workspace_folder")
-        or os.getenv("WORKSPACE_FOLDER")
-        or os.getenv("workspaceFolder")
-        or f"/workspaces/{state['workspace_id']}"
-    )
-    runtime_vars = {"workspaceFolder": workspace_folder}
+        workspace_folder = (
+            (state.get("options") or {}).get("workspace_folder")
+            or os.getenv("WORKSPACE_FOLDER")
+            or os.getenv("workspaceFolder")
+            or f"/workspaces/{state['workspace_id']}"
+        )
+        runtime_vars = {"workspaceFolder": workspace_folder}
 
-    inputs = state.get("inputs") or {}
-    base_vars: Dict[str, Any] = dict(runtime_vars)
-    _flatten("", inputs, base_vars)
+        inputs = state.get("inputs") or {}
+        base_vars: Dict[str, Any] = dict(runtime_vars)
+        _flatten("", inputs, base_vars)
 
-    hints = state.get("_hints") or {}
-    if isinstance(hints, dict):
-        base_vars.update(hints)
+        hints = state.get("_hints") or {}
+        if isinstance(hints, dict):
+            base_vars.update(hints)
 
-    repos = (inputs.get("repos") or [])
-    if repos and isinstance(repos, list) and isinstance(repos[0], dict):
-        base_vars.setdefault("git.url", repos[0].get("url"))
-        base_vars.setdefault("git.branch", repos[0].get("revision") or repos[0].get("branch"))
+        repos = (inputs.get("repos") or [])
+        if repos and isinstance(repos, list) and isinstance(repos[0], dict):
+            base_vars.setdefault("git.url", repos[0].get("url"))
+            base_vars.setdefault("git.branch", repos[0].get("revision") or repos[0].get("branch"))
 
-    ctx = state.setdefault("context", {})
+        ctx = state.setdefault("context", {})
 
-    t = snapshot.get("transport") or {}
-    logger.info(
-        "MCP(exec): step=%s transport.kind=%s command=%s base_url=%s cwd=%s",
-        step_id, (t.get("kind") or "").lower(), t.get("command"), t.get("base_url"), t.get("cwd"),
-    )
+        t = snapshot.get("transport") or {}
+        logger.info(
+            "MCP(exec): step=%s transport.kind=%s command=%s base_url=%s cwd=%s",
+            step_id, (t.get("kind") or "").lower(), t.get("command"), t.get("base_url"), t.get("cwd"),
+        )
 
-    results: List[Dict[str, Any]] = []
-    state.setdefault("_audit_calls", [])
+        results: List[Dict[str, Any]] = []
+        state.setdefault("_audit_calls", [])
 
-    async with IntegrationInvoker(snapshot, runtime_vars=runtime_vars) as inv:
-        for spec in step.get("tool_calls", []):
-            tool = spec.get("tool")
-            timeout_sec = spec.get("timeout_sec")
-            retries = int(spec.get("retries", 0))
+        async with IntegrationInvoker(snapshot, runtime_vars=runtime_vars) as inv:
+            for spec in step.get("tool_calls", []):
+                tool = spec.get("tool")
+                timeout_sec = spec.get("timeout_sec")
+                retries = int(spec.get("retries", 0))
 
-            vars_map: Dict[str, Any] = dict(base_vars)
-            _inject_context_vars(vars_map, ctx)
+                vars_map: Dict[str, Any] = dict(base_vars)
+                _inject_context_vars(vars_map, ctx)
 
-            raw_args: Dict[str, Any] = dict(spec.get("args") or {})
-            raw_args.update(dict(step.get("params") or {}))
-            interpolated = _interpolate(raw_args, vars_map)
+                raw_args: Dict[str, Any] = dict(spec.get("args") or {})
+                raw_args.update(dict(step.get("params") or {}))
+                interpolated = _interpolate(raw_args, vars_map)
 
-            tool_schema = _find_tool_schema(snapshot, tool)
-            args = _filter_args_by_schema(tool_schema or {}, interpolated)
+                tool_schema = _find_tool_schema(snapshot, tool)
+                args = _filter_args_by_schema(tool_schema or {}, interpolated)
 
-            logger.info(
-                "MCP(tool): step=%s tool=%s retries=%s timeout=%s args=%s",
-                step_id, tool, retries, timeout_sec, _args_preview(args),
-            )
+                logger.info(
+                    "MCP(tool): step=%s tool=%s retries=%s timeout=%s args=%s",
+                    step_id, tool, retries, timeout_sec, _args_preview(args),
+                )
 
-            total_produced_for_call = 0
-            kinds_seen: List[str] = []
-            page_index = 0
-            zero_warned = False
-            last_error: Optional[str] = None
+                total_produced_for_call = 0
+                page_index = 0
+                zero_warned = False
+                last_error: Optional[str] = None
 
-            # -------- Lossless pagination loop --------
-            # Keep calling while the tool reports continuation.has_more == True.
-            next_args = dict(args)
-            while True:
-                page_index += 1
-                t0 = time.perf_counter()
-                error: Optional[str] = None
-                produced_this_page = 0
-                page_kinds: List[str] = []
+                # -------- Lossless pagination loop --------
+                # Keep calling while the tool reports continuation.has_more == True.
+                next_args = dict(args)
+                while True:
+                    page_index += 1
+                    t0 = time.perf_counter()
+                    error: Optional[str] = None
+                    produced_this_page = 0
 
-                try:
-                    out = await inv.call_tool(tool, next_args, timeout_sec=timeout_sec, retries=retries, correlation_id=correlation_id)
-
-                    logger.info("MCP(raw): step=%s tool=%s out=%s", step_id, tool, _short_json(out))
-
-                    maybe = _maybe_unwrap_result(out)
-                    if isinstance(maybe, dict) and maybe.get("isError") is True:
-                        raise RuntimeError(_mcp_error_text(maybe))
-
-                    raw_items = _extract_artifacts(out)
-                    if not raw_items and isinstance(maybe, dict) and not zero_warned:
-                        zero_warned = True
-                        logger.warning(
-                            "MCP(extract): step=%s tool=%s produced 0 artifacts; top-level keys=%s",
-                            step_id, tool, _collect_top_keys(maybe),
+                    try:
+                        out = await inv.call_tool(
+                            tool, next_args, timeout_sec=timeout_sec, retries=retries, correlation_id=correlation_id
                         )
 
-                    items = _normalize_artifacts(raw_items)
-                    items = _dedupe_artifacts(items)
+                        logger.info("MCP(raw): step=%s tool=%s out=%s", step_id, tool, _short_json(out))
 
-                    produced_this_page = len(items)
-                    total_produced_for_call += produced_this_page
-                    page_kinds = [i.get("kind_id") or "" for i in items]
-                    kinds_seen.extend(page_kinds)
+                        maybe = _maybe_unwrap_result(out)
+                        if isinstance(maybe, dict) and maybe.get("isError") is True:
+                            raise RuntimeError(_mcp_error_text(maybe))
 
-                    logger.info(
-                        "MCP(result): step=%s tool=%s page=%d produced=%d kinds=%s",
-                        step_id, tool, page_index, produced_this_page, page_kinds,
-                    )
-
-                    _merge_items_into_context(ctx, items)
-                    _update_repo_hints(state, items)
-                    results.extend(items)
-
-                    # prepare next page if any
-                    cont = _extract_continuation(maybe if isinstance(maybe, dict) else {})
-                    if cont and cont.get("has_more"):
-                        next_offset = int(cont.get("next", 0))
-                        next_args = _with_start_at(args, next_offset)
-                        # loop continues
-                    else:
-                        break  # no continuation -> exit loop
-
-                except Exception as e:  # pragma: no cover
-                    error = str(e)
-                    last_error = error
-                    logger.exception("MCP(tool) FAILED: step=%s tool=%s page=%d error=%s", step_id, tool, page_index, error)
-                    # If a page fails, stop paginating to avoid infinite retries here.
-                    break
-
-                finally:
-                    dur_ms = int((time.perf_counter() - t0) * 1000)
-                    call_audit = {
-                        "tool": tool,
-                        "args": _args_preview(next_args),
-                        "duration_ms": dur_ms,
-                        "produced_count": produced_this_page,
-                        "page_index": page_index,
-                        "error": error,
-                    }
-                    state["_audit_calls"].append(call_audit)
-
-                    if append_audit_entry:
-                        try:
-                            await append_audit_entry(
-                                state["run_id"],
-                                {
-                                    "step_id": step_id,
-                                    "capability_id": step.get("capability_id"),
-                                    "mode": "mcp",
-                                    "inputs_preview": {"inputs": {}, "context_keys": list((ctx or {}).keys())},
-                                    "calls": [call_audit],
-                                },
+                        raw_items = _extract_artifacts(out)
+                        if not raw_items and isinstance(maybe, dict) and not zero_warned:
+                            zero_warned = True
+                            logger.warning(
+                                "MCP(extract): step=%s tool=%s produced 0 artifacts; top-level keys=%s",
+                                step_id, tool, _collect_top_keys(maybe),
                             )
-                        except Exception:
-                            pass
 
-                    if error:
-                        # Bubble the last error after auditing
-                        raise RuntimeError(error)
+                        items = _normalize_artifacts(raw_items)
+                        items = _dedupe_artifacts(items)
 
-                # refresh interpolation variables for next page (repo hints may have changed)
-                new_base = dict(runtime_vars)
-                _flatten("", inputs, new_base)
-                if isinstance(state.get("_hints"), dict):
-                    new_base.update(state["_hints"])  # type: ignore[index]
-                _inject_context_vars(new_base, ctx)
-                # keep original 'args' as baseline; we only override start_at for the next page
-                base_vars = new_base  # noqa: F841  # (kept for parity with earlier flow)
+                        produced_this_page = len(items)
+                        total_produced_for_call += produced_this_page
 
-            # END pagination while-True
+                        _merge_items_into_context(ctx, items)
+                        _update_repo_hints(state, items)
+                        results.extend(items)
 
-            # After all pages of this tool call
-            if last_error:
-                # Shouldn’t happen because we raise inside the loop, but double-guard.
-                raise RuntimeError(last_error)
+                        # prepare next page if any
+                        cont = _extract_continuation(maybe if isinstance(maybe, dict) else {})
+                        if cont and cont.get("has_more"):
+                            next_offset = int(cont.get("next", 0))
+                            next_args = _with_start_at(args, next_offset)
+                            # loop continues
+                        else:
+                            break  # no continuation -> exit loop
 
-    state["last_output"] = results
-    state["last_stats"] = {"produced_total": len(results)}
-    state["context"] = ctx
-    return state
+                    except Exception as e:  # pragma: no cover
+                        error = str(e)
+                        last_error = error
+                        logger.exception("MCP(tool) FAILED: step=%s tool=%s page=%d error=%s", step_id, tool, page_index, error)
+                        # If a page fails, stop paginating to avoid infinite retries here.
+                        break
+
+                    finally:
+                        dur_ms = int((time.perf_counter() - t0) * 1000)
+                        call_audit = {
+                            "tool": tool,
+                            "args": _args_preview(next_args),
+                            "duration_ms": dur_ms,
+                            "produced_count": produced_this_page,
+                            "page_index": page_index,
+                            "error": error,
+                        }
+                        state["_audit_calls"].append(call_audit)
+
+                        if append_audit_entry:
+                            try:
+                                await append_audit_entry(
+                                    state["run_id"],
+                                    {
+                                        "step_id": step_id,
+                                        "capability_id": step.get("capability_id"),
+                                        "mode": "mcp",
+                                        "inputs_preview": {"inputs": {}, "context_keys": list((ctx or {}).keys())},
+                                        "calls": [call_audit],
+                                    },
+                                )
+                            except Exception:
+                                pass
+
+                        if error:
+                            # Bubble the last error after auditing
+                            raise RuntimeError(error)
+
+                # END pagination while-True
+
+                # After all pages of this tool call
+                if last_error:
+                    # Shouldn’t happen because we raise inside the loop, but double-guard.
+                    raise RuntimeError(last_error)
+
+        state["last_output"] = results
+        state["last_stats"] = {"produced_total": len(results)}
+        state["context"] = ctx
+        return state
+
+    except Exception as e:
+        # Publish step.failed (generic + specific) and re-raise
+        rt = state.get("_step_runtime", {}).get(step_id) or {}
+        started_at = rt.get("started_at") or datetime.utcnow()
+        ended_at = datetime.utcnow()
+        duration_s = (ended_at - started_at).total_seconds()
+
+        payload = LearningStepFailed(
+            run_id=state["run_id"],
+            workspace_id=state["workspace_id"],
+            playbook_id=state["playbook_id"],
+            step=StepInfo(id=str(step_id), capability_id=step.get("capability_id"), name=step.get("name")),
+            params=(step.get("params") or {}),
+            produces_kinds=list(step.get("produces_kinds") or []),
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_s=duration_s,
+            error=str(e),
+        ).model_dump(mode="json")
+
+        headers = {}
+        if state.get("correlation_id"):
+            headers["x-correlation-id"] = state["correlation_id"]
+        await publish_step_event_v1(status="failed", payload=payload, headers=headers)
+
+        state.setdefault("_step_runtime", {}).setdefault(str(step_id), {})["status"] = "failed"
+        raise
