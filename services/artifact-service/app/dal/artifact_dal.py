@@ -1,4 +1,4 @@
-#services/artifact-service/app/dal/artifact_dal.py
+# services/artifact-service/app/dal/artifact_dal.py
 from __future__ import annotations
 
 import json
@@ -19,6 +19,7 @@ from ..models.artifact import (
     WorkspaceSnapshot,
     Provenance,
     Lineage,
+    DiagramInstance,
 )
 
 WORKSPACE_ARTIFACTS = "workspace_artifacts"
@@ -28,7 +29,7 @@ PATCHES = "artifact_patches"
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
-def _canonical(data: Dict[str, Any]) -> str:
+def _canonical(data: Any) -> str:
     """Stable JSON for hashing/compare. Removes volatile keys if present."""
     return json.dumps(data, sort_keys=True, separators=(",", ":"))
 
@@ -38,6 +39,19 @@ def _sha256(s: str) -> str:
 def _fallback_natural_key(kind: str, name: str) -> str:
     """If caller didn't compute per-kind natural key, fall back to kind+name."""
     return f"{kind}:{name}".lower().strip()
+
+def _normalize_diagrams(diagrams: Optional[List[DiagramInstance]]) -> List[Dict[str, Any]]:
+    """Convert Pydantic models to dicts and normalize missing → []."""
+    if not diagrams:
+        return []
+    out: List[Dict[str, Any]] = []
+    for d in diagrams:
+        if isinstance(d, DiagramInstance):
+            out.append(d.model_dump())
+        else:
+            # Accept raw dicts too (defensive)
+            out.append(d)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────
@@ -53,6 +67,7 @@ async def ensure_indexes(db: AsyncIOMotorDatabase):
     await col.create_index([("artifacts.artifact_id", ASCENDING)])
     await col.create_index([("artifacts.natural_key", ASCENDING)])
     await col.create_index([("artifacts.fingerprint", ASCENDING)])
+    await col.create_index([("artifacts.diagram_fingerprint", ASCENDING)])  # NEW
     await col.create_index([("artifacts.kind", ASCENDING), ("artifacts.name", ASCENDING)])
     await col.create_index([("artifacts.deleted_at", ASCENDING)])
 
@@ -69,6 +84,7 @@ async def ensure_indexes(db: AsyncIOMotorDatabase):
 
 # ─────────────────────────────────────────────────────────────
 # Parent doc lifecycle
+# (unchanged)
 # ─────────────────────────────────────────────────────────────
 async def create_parent_doc(
     db: AsyncIOMotorDatabase,
@@ -125,7 +141,7 @@ async def delete_parent_doc(db, workspace_id: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
-# Baseline inputs (new)
+# Baseline inputs (unchanged)
 # ─────────────────────────────────────────────────────────────
 def _upsert_fss_stories(existing_stories: List[Dict[str, Any]], to_upsert: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     index = {s.get("key"): i for i, s in enumerate(existing_stories) if isinstance(s, dict) and s.get("key")}
@@ -241,7 +257,7 @@ async def merge_inputs_baseline(
             "$set": {
                 "inputs_baseline": base,
                 "inputs_baseline_fingerprint": fp,
-                "updated_at": now,
+                "updated_at": datetime.utcnow(),
             },
             "$inc": {"inputs_baseline_version": 1},
         },
@@ -252,6 +268,7 @@ async def merge_inputs_baseline(
 
 # ─────────────────────────────────────────────────────────────
 # Artifact queries
+# (unchanged)
 # ─────────────────────────────────────────────────────────────
 async def _find_artifact_by_natural_key(
     db: AsyncIOMotorDatabase, workspace_id: str, natural_key: str
@@ -342,7 +359,7 @@ async def upsert_artifact(
     run_id: Optional[str] = None,
 ) -> Tuple[ArtifactItem, str]:
     """
-    Versioned, idempotent upsert by natural_key+fingerprint.
+    Versioned, idempotent upsert by natural_key + data/diagram fingerprints.
 
     Returns: (artifact, op) where op ∈ {"insert","update","noop"}
     """
@@ -355,7 +372,11 @@ async def upsert_artifact(
 
     # Compute identity if caller didn't provide
     natural_key = payload.natural_key or _fallback_natural_key(payload.kind, payload.name)
-    fingerprint = payload.fingerprint or _sha256(_canonical(payload.data))
+
+    # Fingerprints
+    data_fp = payload.fingerprint or _sha256(_canonical(payload.data))
+    diagrams_norm = _normalize_diagrams(payload.diagrams)
+    diagrams_fp = _sha256(_canonical(diagrams_norm)) if diagrams_norm else None
 
     # Lookup by NK
     existing = await _find_artifact_by_natural_key(db, workspace_id, natural_key)
@@ -367,8 +388,10 @@ async def upsert_artifact(
             kind=payload.kind,
             name=payload.name,
             data=payload.data,
+            diagrams=diagrams_norm,
             natural_key=natural_key,
-            fingerprint=fingerprint,
+            fingerprint=data_fp,
+            diagram_fingerprint=diagrams_fp,
             version=1,
             lineage=Lineage(
                 first_seen_run_id=run_id, last_seen_run_id=run_id, supersedes=[], superseded_by=None
@@ -385,8 +408,16 @@ async def upsert_artifact(
             raise ValueError(f"Workspace parent not found for {workspace_id}")
         return item, "insert"
 
-    # If identical content, only touch lineage.last_seen_run_id
-    if existing.fingerprint == fingerprint:
+    # Compare existing content
+    existing_data_fp = existing.fingerprint
+    existing_diag_fp = getattr(existing, "diagram_fingerprint", None)
+
+    data_changed = (existing_data_fp != data_fp)
+    diagrams_changed = (diagrams_fp is not None and diagrams_fp != existing_diag_fp) or \
+                       (diagrams_fp is None and existing_diag_fp is not None and diagrams_norm == [])
+
+    if not data_changed and not diagrams_changed:
+        # No changes → just touch lineage/updated_at
         res = await db[WORKSPACE_ARTIFACTS].find_one_and_update(
             {
                 "workspace_id": workspace_id,
@@ -406,7 +437,19 @@ async def upsert_artifact(
         a = next((x for x in res["artifacts"] if x.get("natural_key") == natural_key), None)
         return ArtifactItem(**a), "noop"
 
-    # Changed → bump version, update lineage & fingerprint/data
+    # Prepare update
+    set_fields: Dict[str, Any] = {
+        "artifacts.$.lineage.last_seen_run_id": run_id,
+        "artifacts.$.updated_at": now,
+        "updated_at": now,
+    }
+    if data_changed:
+        set_fields["artifacts.$.data"] = payload.data
+        set_fields["artifacts.$.fingerprint"] = data_fp
+    if diagrams_changed:
+        set_fields["artifacts.$.diagrams"] = diagrams_norm
+        set_fields["artifacts.$.diagram_fingerprint"] = diagrams_fp
+
     res = await db[WORKSPACE_ARTIFACTS].find_one_and_update(
         {
             "workspace_id": workspace_id,
@@ -414,14 +457,7 @@ async def upsert_artifact(
             "artifacts.deleted_at": None,
         },
         {
-            "$set": {
-                "artifacts.$.data": payload.data,
-                "artifacts.$.fingerprint": fingerprint,
-                "artifacts.$.provenance": (prov.model_dump() if prov else None),
-                "artifacts.$.lineage.last_seen_run_id": run_id,
-                "artifacts.$.updated_at": now,
-                "updated_at": now,
-            },
+            "$set": set_fields,
             "$inc": {"artifacts.$.version": 1},
         },
         return_document=ReturnDocument.AFTER,
@@ -438,23 +474,30 @@ async def replace_artifact(
     db: AsyncIOMotorDatabase,
     workspace_id: str,
     artifact_id: str,
-    new_data: Dict[str, Any],
+    new_data: Optional[Dict[str, Any]],
     prov: Optional[Provenance],
+    new_diagrams: Optional[List[DiagramInstance]] = None,
 ) -> ArtifactItem:
     now = datetime.utcnow()
-    canonical = _canonical(new_data)
-    fingerprint = _sha256(canonical)
+
+    # Compute new fingerprints
+    set_fields: Dict[str, Any] = {
+        "artifacts.$[a].updated_at": now,
+        "updated_at": now,
+        "artifacts.$[a].provenance": (prov.model_dump() if prov else None),
+    }
+    if new_data is not None:
+        set_fields["artifacts.$[a].data"] = new_data
+        set_fields["artifacts.$[a].fingerprint"] = _sha256(_canonical(new_data))
+    if new_diagrams is not None:
+        diagrams_norm = _normalize_diagrams(new_diagrams)
+        set_fields["artifacts.$[a].diagrams"] = diagrams_norm
+        set_fields["artifacts.$[a].diagram_fingerprint"] = _sha256(_canonical(diagrams_norm)) if diagrams_norm else None
 
     res = await db[WORKSPACE_ARTIFACTS].find_one_and_update(
         {"workspace_id": workspace_id},
         {
-            "$set": {
-                "artifacts.$[a].data": new_data,
-                "artifacts.$[a].fingerprint": fingerprint,
-                "artifacts.$[a].provenance": (prov.model_dump() if prov else None),
-                "artifacts.$[a].updated_at": now,
-                "updated_at": now,
-            },
+            "$set": set_fields,
             "$inc": {"artifacts.$[a].version": 1},
         },
         array_filters=[{"a.artifact_id": artifact_id}],
@@ -495,7 +538,7 @@ async def soft_delete_artifact(
 
 
 # ─────────────────────────────────────────────────────────────
-# Patch history
+# Patch history (unchanged)
 # ─────────────────────────────────────────────────────────────
 async def record_patch(
     db: AsyncIOMotorDatabase,
@@ -527,13 +570,9 @@ async def list_patches(
 
 
 # ─────────────────────────────────────────────────────────────
-# Run delta computation
+# Run delta computation (unchanged)
 # ─────────────────────────────────────────────────────────────
 def _prov_run_id(prov: Optional[Provenance | Dict[str, Any]]) -> Optional[str]:
-    """
-    Safely extract run_id from provenance whether it's a Pydantic model,
-    a plain dict, or None.
-    """
     if prov is None:
         return None
     if hasattr(prov, "run_id"):
@@ -552,14 +591,6 @@ def compute_run_deltas(
     run_id: str,
     include_ids: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Compute per-run deltas by scanning embedded artifacts:
-      - new: lineage.first_seen_run_id == run_id
-      - updated: provenance.run_id == run_id and not new
-      - unchanged: lineage.last_seen_run_id == run_id and not (new|updated) and not deleted
-      - retired: seen previously but not seen in this run (last_seen_run_id != run_id) and not deleted
-      - deleted: deleted_at != None
-    """
     buckets = {
         "new": [],
         "updated": [],
@@ -569,7 +600,6 @@ def compute_run_deltas(
     }
 
     for a in parent.artifacts:
-        # Deleted always counts as deleted, regardless of run linkage
         if getattr(a, "deleted_at", None) is not None:
             buckets["deleted"].append(a.artifact_id)
             continue

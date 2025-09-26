@@ -9,7 +9,7 @@ from app.dal.kind_registry_dal import upsert_kind
 LATEST = "1.0.0"
 
 # ─────────────────────────────────────────────────────────────
-# Canonical seed docs (exactly as specified by the user)
+# Canonical seed docs (with diagram_recipes)
 # ─────────────────────────────────────────────────────────────
 KIND_DOCS: List[Dict[str, Any]] = [
     {
@@ -45,7 +45,24 @@ KIND_DOCS: List[Dict[str, Any]] = [
                 "commit": "8f2c1b...",
                 "branch": "main",
                 "paths_root": "/mnt/src/cards"
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "repo.mindmap",
+                    "title": "Repo Snapshot Mindmap",
+                    "view": "mindmap",
+                    "language": "mermaid",
+                    "description": "Quick overview of repo → branch/commit and tags.",
+                    "template": """mindmap
+  root(({{ data.repo }}))
+    Branch: {{ data.branch }}
+    Commit: {{ data.commit }}
+    Paths Root: {{ data.paths_root }}
+    Tags
+      {% for t in (data.tags or []) %}{{ t }}
+      {% endfor %}"""
+                }
+            ]
         }]
     },
     {
@@ -103,7 +120,21 @@ KIND_DOCS: List[Dict[str, Any]] = [
                     {"relpath": "batch/POSTTRAN.jcl", "size_bytes": 213, "sha256": "...", "kind": "jcl"},
                     {"relpath": "copy/CUSTREC.cpy", "size_bytes": 982, "sha256": "...", "kind": "copybook"}
                 ]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "source_index.treemap",
+                    "title": "Source Index Treemap",
+                    "view": "flowchart",
+                    "language": "mermaid",
+                    "description": "Kind-bucketed file overview.",
+                    "prompt": {
+                        "system": "Summarize the Source Index into a Mermaid flowchart grouping files by kind. Keep labels short; do not list more than 50 nodes.",
+                        "strict_text": True
+                    },
+                    "renderer_hints": {"direction": "LR"}
+                }
+            ]
         }]
     },
     {
@@ -195,7 +226,56 @@ KIND_DOCS: List[Dict[str, Any]] = [
                 "source": {"relpath": "batch/POSTTRAN.cbl", "sha256": "..."},
                 "divisions": {"identification": {}, "environment": {}, "data": {}, "procedure": {}},
                 "paragraphs": [{"name": "MAIN", "performs": ["VALIDATE-INPUT"], "calls": [], "io_ops": []}]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "program.mindmap",
+                    "title": "Program → Divisions → Paragraphs (Mindmap)",
+                    "view": "mindmap",
+                    "language": "mermaid",
+                    "description": "High-level overview: program root, divisions, and paragraph nodes.",
+                    "template": """mindmap
+  root(({{ data.program_id }}))
+  {% if data.divisions.identification %}Identification{% endif %}
+  {% if data.divisions.environment %}Environment{% endif %}
+  {% if data.divisions.data %}Data{% endif %}
+  Procedure
+    {% for p in data.paragraphs %}{{ p.name }}
+    {% endfor %}
+classDef divisions fill:#eee,stroke:#999;"""
+                },
+                {
+                    "id": "program.sequence",
+                    "title": "Paragraph CALL / PERFORM Sequence",
+                    "view": "sequence",
+                    "language": "mermaid",
+                    "description": "Dynamic interaction across paragraphs and called programs.",
+                    "prompt": {
+                        "system": "Given the canonical cam.cobol.program JSON, emit Mermaid sequence diagram instructions describing PERFORM and CALL interactions. Use paragraph names and PROGRAM-ID targets. Do not fabricate nodes.",
+                        "strict_text": True
+                    },
+                    "renderer_hints": {"wrap": True}
+                },
+                {
+                    "id": "program.flowchart",
+                    "title": "Paragraph PERFORM Flow",
+                    "view": "flowchart",
+                    "language": "mermaid",
+                    "description": "Control flow between paragraphs via PERFORM edges.",
+                    "template": """flowchart TD
+  START([{{ data.program_id }} START])
+  {% for p in data.paragraphs %}
+  {{ p.name | replace("-", "_") }}([{{ p.name }}])
+  {% endfor %}
+  {% if data.paragraphs|length > 0 %}START --> {{ data.paragraphs[0].name | replace("-", "_") }}{% endif %}
+  {% for p in data.paragraphs %}
+    {% for t in (p.performs or []) %}
+  {{ p.name | replace("-", "_") }} --> {{ t | replace("-", "_") }}
+    {% endfor %}
+  {% endfor %}
+  END([END])"""
+                }
+            ]
         }]
     },
     {
@@ -245,7 +325,23 @@ KIND_DOCS: List[Dict[str, Any]] = [
                 "source": {"relpath": "copy/CUSTREC.cpy", "sha256": "..."},
                 "items": [{"level": "01", "name": "CUST-REC", "picture": "", "children": [
                     {"level": "05", "name": "CUST-ID", "picture": "X(10)"}]}]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "copybook.mindmap",
+                    "title": "Copybook Fields Mindmap",
+                    "view": "mindmap",
+                    "language": "mermaid",
+                    "description": "Hierarchy of fields by levels.",
+                    "template": """mindmap
+  root(({{ data.name }}))
+  {% for item in data.items %}
+  {{ item.level }} {{ item.name }}
+    {% for c in (item.children or []) %}{{ c.level }} {{ c.name }}
+    {% endfor %}
+  {% endfor %}"""
+                }
+            ]
         }]
     },
     {
@@ -312,7 +408,28 @@ KIND_DOCS: List[Dict[str, Any]] = [
                         {"ddname": "OUTFILE", "dataset": "LEDGER.OUT", "direction": "OUT"}
                     ]
                 }]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "jcl.flow",
+                    "title": "JCL Job Flow (Steps)",
+                    "view": "flowchart",
+                    "language": "mermaid",
+                    "description": "Simple TD flow through steps by seq, annotated with program names.",
+                    "template": """flowchart TD
+  START([{{ data.job_name }} START])
+  {% for s in data.steps|sort(attribute='seq') %}
+  {{ s.step_name }}([{{ s.step_name }}\\n{{ s.program }}])
+  {% endfor %}
+  {% for s in data.steps|sort(attribute='seq') %}
+    {% set next = loop.index0 + 1 %}
+    {% if next < (data.steps|length) %}
+  {{ data.steps[loop.index0].step_name }} --> {{ data.steps[next].step_name }}
+    {% endif %}
+  {% endfor %}
+  END([END])"""
+                }
+            ]
         }]
     },
     {
@@ -358,7 +475,26 @@ KIND_DOCS: List[Dict[str, Any]] = [
                 "seq": 1,
                 "program": "POSTTRAN",
                 "dds": [{"ddname": "INFILE", "dataset": "TRAN.IN", "direction": "IN"}]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "jcl.step.io",
+                    "title": "JCL Step IO",
+                    "view": "flowchart",
+                    "language": "mermaid",
+                    "description": "Visualize datasets in/out of a step.",
+                    "template": """flowchart LR
+  {{ data.step_name }}([{{ data.step_name }}\\n{{ data.program }}])
+  {% for d in data.dds %}
+    {% if d.direction == "IN" or d.direction == "INOUT" %}
+  {{ d.ddname | replace("-", "_") }}([{{ d.dataset or d.ddname }}]) --> {{ data.step_name }}
+    {% endif %}
+    {% if d.direction == "OUT" or d.direction == "INOUT" %}
+  {{ data.step_name }} --> {{ d.ddname | replace("-", "_") }}([{{ d.dataset or d.ddname }}])
+    {% endif %}
+  {% endfor %}"""
+                }
+            ]
         }]
     },
     {
@@ -399,7 +535,22 @@ KIND_DOCS: List[Dict[str, Any]] = [
             "examples": [{
                 "region": "CICSPROD",
                 "transactions": [{"tranid": "PAY1", "program": "PAYMENT"}, {"tranid": "BAL1", "program": "BALENQ"}]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "cics.map",
+                    "title": "CICS Transaction → Program",
+                    "view": "flowchart",
+                    "language": "mermaid",
+                    "description": "Map tranid to program; optional mapset/commarea labels.",
+                    "template": """flowchart LR
+  subgraph {{ data.region }}
+  {% for t in data.transactions %}
+  {{ t.tranid }}([{{ t.tranid }}]) --> {{ t.program | replace("-", "_") }}([{{ t.program }}])
+  {% endfor %}
+  end"""
+                }
+            ]
         }]
     },
     {
@@ -484,7 +635,23 @@ KIND_DOCS: List[Dict[str, Any]] = [
                     "name": "TRAN.IN", "type": "SEQ",
                     "columns": [{"name": "AMOUNT", "pic_or_sqltype": "S9(7)V99"}]
                 }]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "data.er",
+                    "title": "Logical ER Diagram",
+                    "view": "er",
+                    "language": "mermaid",
+                    "description": "Render logical entities and fields as Mermaid ER.",
+                    "template": """erDiagram
+  {% for e in data.logical %}
+  {{ e.name }} {
+    {% for f in e.fields %}{{ f.type | replace(" ", "_") }} {{ f.name }}
+    {% endfor %}
+  }
+  {% endfor %}"""
+                }
+            ]
         }]
     },
     {
@@ -526,7 +693,23 @@ KIND_DOCS: List[Dict[str, Any]] = [
             "identity": {"natural_key": ["terms[*].term"]},
             "examples": [{
                 "terms": [{"term": "Account Balance", "definition": "Current monetary balance on an account.", "aliases": ["BAL", "ACCT-BAL"]}]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "terms.mindmap",
+                    "title": "Terms Mindmap",
+                    "view": "mindmap",
+                    "language": "mermaid",
+                    "description": "Terms with aliases as child leaves.",
+                    "template": """mindmap
+  root((Data Dictionary))
+  {% for t in data.terms %}
+  {{ t.term }}
+    {% for a in (t.aliases or []) %}{{ a }}
+    {% endfor %}
+  {% endfor %}"""
+                }
+            ]
         }]
     },
     {
@@ -568,7 +751,21 @@ KIND_DOCS: List[Dict[str, Any]] = [
                     {"from": "TRAN.IN.AMOUNT", "to": "POSTTRAN.MAIN.AMOUNT", "op": "READ"},
                     {"from": "POSTTRAN.MAIN.BALANCE", "to": "LEDGER.OUT.BALANCE", "op": "WRITE"}
                 ]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "lineage.graph",
+                    "title": "Lineage Graph",
+                    "view": "flowchart",
+                    "language": "mermaid",
+                    "description": "Show lineage edges as a directed graph.",
+                    "prompt": {
+                        "system": "Render lineage edges as a Mermaid flowchart LR. Use succinct node ids; collapse duplicate edges; annotate edges with op (READ/WRITE/TRANSFORM).",
+                        "strict_text": True
+                    },
+                    "renderer_hints": {"direction": "LR"}
+                }
+            ]
         }]
     },
     {
@@ -600,7 +797,30 @@ KIND_DOCS: List[Dict[str, Any]] = [
                 "jobs": ["POSTTRAN"],
                 "datasets": ["TRAN.IN", "LEDGER.OUT"],
                 "transactions": []
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "inventory.mindmap",
+                    "title": "Service/Asset Inventory Mindmap",
+                    "view": "mindmap",
+                    "language": "mermaid",
+                    "description": "Top-level inventory grouped by artifact class.",
+                    "template": """mindmap
+  root((Inventory))
+    Programs
+      {% for p in data.programs %}{{ p }}
+      {% endfor %}
+    Jobs
+      {% for j in data.jobs %}{{ j }}
+      {% endfor %}
+    Datasets
+      {% for d in data.datasets %}{{ d }}
+      {% endfor %}
+    Transactions
+      {% for t in data.transactions %}{{ t }}
+      {% endfor %}"""
+                }
+            ]
         }]
     },
     {
@@ -663,7 +883,49 @@ KIND_DOCS: List[Dict[str, Any]] = [
                 "call_graph": [],
                 "job_flow": [{"job": "POSTTRAN", "step": "STEP1", "seq": 1, "program": "POSTTRAN"}],
                 "dataset_deps": [{"producer": "STEP1", "dataset": "LEDGER.OUT", "consumer": "DOWNSTREAM"}]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "deps.callgraph",
+                    "title": "Program Call Graph",
+                    "view": "flowchart",
+                    "language": "mermaid",
+                    "description": "Static call edges across programs.",
+                    "prompt": {
+                        "system": "Render call_graph as Mermaid graph LR with from --> to. Merge duplicates. Mark dynamic edges with dotted style.",
+                        "strict_text": True
+                    },
+                    "renderer_hints": {"direction": "LR"}
+                },
+                {
+                    "id": "deps.jobflow",
+                    "title": "Job Flow",
+                    "view": "flowchart",
+                    "language": "mermaid",
+                    "description": "Sequential flow of job steps.",
+                    "template": """flowchart TD
+  {% for e in data.job_flow|sort(attribute='seq') %}
+  {{ e.step | replace("-", "_") }}([{{ e.job }}::{{ e.step }}\\n{{ e.program }}])
+  {% endfor %}
+  {% for e in data.job_flow|sort(attribute='seq') %}
+    {% set next = loop.index0 + 1 %}
+    {% if next < (data.job_flow|length) %}
+  {{ data.job_flow[loop.index0].step | replace("-", "_") }} --> {{ data.job_flow[next].step | replace("-", "_") }}
+    {% endif %}
+  {% endfor %}"""
+                },
+                {
+                    "id": "deps.dataset",
+                    "title": "Dataset Producers/Consumers",
+                    "view": "flowchart",
+                    "language": "mermaid",
+                    "description": "Edges from producers to consumers via dataset nodes.",
+                    "template": """flowchart LR
+  {% for d in data.dataset_deps %}
+  {{ d.producer | replace("-", "_") }} --> {{ d.dataset | replace(".", "_") }}([{{ d.dataset }}]) --> {{ d.consumer | replace("-", "_") }}
+  {% endfor %}"""
+                }
+            ]
         }]
     },
     {
@@ -741,7 +1003,27 @@ KIND_DOCS: List[Dict[str, Any]] = [
                     {"id": "n2", "kind": "end", "label": "End"}
                 ],
                 "edges": [{"from": "n0", "to": "n1"}, {"from": "n1", "to": "n2"}]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "process.activity",
+                    "title": "Process Activity Flow",
+                    "view": "activity",
+                    "language": "mermaid",
+                    "description": "Flowchart rendering of nodes and edges; lane shown as subgraph if present.",
+                    "template": """flowchart TD
+  {% for l in (data.lanes or []) %}
+  subgraph lane_{{ l.id }}[{{ l.label }}]
+  end
+  {% endfor %}
+  {% for n in data.nodes %}
+  {{ n.id }}([{{ n.label }}])
+  {% endfor %}
+  {% for e in data.edges %}
+  {{ e.from }} -->{% if e.condition %}|{{ e.condition }}|{% endif %} {{ e.to }}
+  {% endfor %}"""
+                }
+            ]
         }]
     },
     {
@@ -767,7 +1049,20 @@ KIND_DOCS: List[Dict[str, Any]] = [
             "depends_on": {"hard": ["cam.workflow.process"]},
             "identity": {"natural_key": ["source_process"]},
             "adapters": [{"type": "dsl", "dsl": {"to_plantuml": "activity_dsl_to_puml"}}],
-            "examples": [{"source_process": "POSTTRAN Batch", "diagram": {"nodes": [], "edges": []}}]
+            "examples": [{"source_process": "POSTTRAN Batch", "diagram": {"nodes": [], "edges": []}}],
+            "diagram_recipes": [
+                {
+                    "id": "diagram.activity.puml",
+                    "title": "PlantUML Activity",
+                    "view": "activity",
+                    "language": "plantuml",
+                    "description": "Render activity JSON via adapter to PlantUML instructions.",
+                    "prompt": {
+                        "system": "Convert the activity diagram JSON to PlantUML instructions. Keep ids stable; use partitions for lanes if present.",
+                        "strict_text": True
+                    }
+                }
+            ]
         }]
     },
     {
@@ -813,7 +1108,27 @@ KIND_DOCS: List[Dict[str, Any]] = [
                     "aliases": ["TXN"],
                     "mappings": ["copybook:CUST-REC", "table:TRAN.IN"]
                 }]
-            }]
+            }],
+            "diagram_recipes": [
+                {
+                    "id": "domain.terms.map",
+                    "title": "Domain Terms Map",
+                    "view": "mindmap",
+                    "language": "mermaid",
+                    "description": "Domain terms grouped by kind with aliases.",
+                    "template": """mindmap
+  root((Domain Dictionary))
+  {% set kinds = {"entity":[], "event":[], "metric":[], "policy":[], "other":[]} %}
+  {% for e in data.entries %}{% do kinds[e.kind].append(e) %}{% endfor %}
+  {% for k, arr in kinds.items() %}
+  {{ k | capitalize }}
+    {% for e in arr %}{{ e.term }}
+      {% for a in (e.aliases or []) %}{{ a }}
+      {% endfor %}
+    {% endfor %}
+  {% endfor %}"""
+                }
+            ]
         }]
     },
 ]

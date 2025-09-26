@@ -47,6 +47,10 @@ async def ensure_registry_indexes(db: AsyncIOMotorDatabase) -> None:
     await kinds.create_index([("aliases", ASCENDING)])   # multikey for alias lookup
     await kinds.create_index([("status", ASCENDING)])    # filter by status
     await kinds.create_index([("category", ASCENDING)])  # filter by category
+    # Optional: query by diagram views/languages if needed in the future
+    # (kept commented to avoid index bloat)
+    # await kinds.create_index([("schema_versions.diagram_recipes.view", ASCENDING)])
+    # await kinds.create_index([("schema_versions.diagram_recipes.language", ASCENDING)])
 
     plugins = db[KIND_PLUGINS]
     await plugins.create_index([("type", ASCENDING)])
@@ -111,6 +115,54 @@ async def get_schema_version_entry(
     for entry in k.schema_versions:
         if entry.version == target:
             return entry.model_dump()
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Diagram helpers (NEW)
+# ─────────────────────────────────────────────────────────────
+
+async def get_diagram_recipes(
+    db: AsyncIOMotorDatabase,
+    kind_id: str,
+    version: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Return all diagram_recipes for the given kind/version.
+    """
+    entry = await get_schema_version_entry(db, kind_id, version)
+    if not entry:
+        return []
+    return entry.get("diagram_recipes", []) or []
+
+
+async def get_diagram_recipe(
+    db: AsyncIOMotorDatabase,
+    kind_id: str,
+    *,
+    version: Optional[str] = None,
+    recipe_id: Optional[str] = None,
+    view: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Resolve a single diagram recipe by id (preferred) or by view.
+    If both are provided, id wins.
+    """
+    recipes = await get_diagram_recipes(db, kind_id, version)
+    if not recipes:
+        return None
+    if recipe_id:
+        for r in recipes:
+            if r.get("id") == recipe_id:
+                return r
+        return None
+    if view:
+        # return first matching view
+        for r in recipes:
+            if r.get("view") == view:
+                return r
+        return None
+    # neither id nor view specified
     return None
 
 

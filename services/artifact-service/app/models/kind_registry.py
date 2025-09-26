@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-
 # ─────────────────────────────────────────────────────────────
 # Prompt specs
 # ─────────────────────────────────────────────────────────────
@@ -21,38 +20,77 @@ class PromptVariantSpec(BaseModel):
 class PromptSpec(BaseModel):
     """
     Canonical prompt content for the kind+schema_version.
-    Note: prompts can be composed/enriched by learning-service using depends_on.
     """
     system: str
     user_template: Optional[str] = None
-    variants: List[PromptVariantSpec] = []
+    variants: List[PromptVariantSpec] = Field(default_factory=list)
     io_hints: Optional[Dict[str, Any]] = None
     strict_json: bool = True
-    prompt_rev: int = 1  # non-breaking prompt iterations
+    prompt_rev: int = 1
 
 
 # ─────────────────────────────────────────────────────────────
-# Identity / normalization / adapters / migrators
+# Diagram generation specs
+# ─────────────────────────────────────────────────────────────
+
+DiagramLanguage = Literal["mermaid", "plantuml", "graphviz", "d2", "nomnoml", "dot"]
+DiagramView = Literal[
+    "sequence", "flowchart", "class", "component", "deployment",
+    "state", "activity", "mindmap", "er", "gantt", "timeline", "journey",
+]
+
+class DiagramPromptSpec(BaseModel):
+    """
+    Prompt to produce diagram *instructions* (plain text in the target language),
+    not JSON. Agents use this when no static template is sufficient.
+    """
+    system: str
+    user_template: Optional[str] = None
+    variants: List[PromptVariantSpec] = Field(default_factory=list)
+    strict_text: bool = True
+    prompt_rev: int = 1
+    io_hints: Optional[Dict[str, Any]] = None  # e.g., {"max_tokens": 1500}
+
+class DiagramRecipeSpec(BaseModel):
+    """
+    A single diagram representation ("recipe") for a schema version.
+    An agent can emit diagram instructions using either the `template`
+    (deterministic) and/or the `prompt` (LLM-generated).
+    """
+    id: str                                  # e.g., "program.sequence", unique per schema version
+    title: str                               # e.g., "Program Call Sequence"
+    view: DiagramView                        # e.g., "sequence", "flowchart", "mindmap"
+    language: DiagramLanguage = "mermaid"    # default → Mermaid
+    description: Optional[str] = None
+
+    # One or both may be provided:
+    template: Optional[str] = None           # Jinja/format template -> diagram instructions
+    prompt: Optional[DiagramPromptSpec] = None
+
+    renderer_hints: Optional[Dict[str, Any]] = None  # width, theme, direction, etc.
+    examples: List[Dict[str, Any]] = Field(default_factory=list)  # {"data": <valid data>, "diagram": "<instructions>"}
+
+    # Optional dependencies/context the recipe needs to consider (overrides or adds to SchemaVersionSpec.depends_on)
+    depends_on: Optional["DependsOnSpec"] = None
+
+
+# ─────────────────────────────────────────────────────────────
+# Identity / adapters / migrators
 # ─────────────────────────────────────────────────────────────
 
 class IdentitySpec(BaseModel):
-    """
-    Declarative identity rules; evaluated by service layer (not DAL).
-    """
-    natural_key: Optional[Any] = None   # e.g., ["data.program", "data.step"]
-    summary_rule: Optional[str] = None  # e.g., "{{data.program}} ({{data.type}})"
-    category: Optional[str] = None      # often fixed by kind (e.g., "code")
+    natural_key: Optional[Any] = None
+    summary_rule: Optional[str] = None
+    category: Optional[str] = None
 
 
 class AdapterSpec(BaseModel):
-    # Adapters normalize miner/LLM output → canonical "data"
     type: Literal["builtin", "dsl"] = "builtin"
     ref: Optional[str] = None
-    dsl: Optional[Dict[str, Any]] = None  # optional declarative transform
+    dsl: Optional[Dict[str, Any]] = None
 
 
 class MigratorSpec(BaseModel):
-    # Version-to-version data migrators (data-only)
     from_version: str
     to_version: str
     type: Literal["builtin", "dsl"] = "builtin"
@@ -61,20 +99,12 @@ class MigratorSpec(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────
-# NEW: First-class dependency spec for kinds
+# Dependencies
 # ─────────────────────────────────────────────────────────────
 
 class DependsOnSpec(BaseModel):
-    """
-    First-class dependency declaration for a schema version.
-
-    - hard: artifacts the produced artifact MUST align with (if present).
-    - soft: artifacts that SHOULD be reused if present; otherwise infer.
-    - context_hint: optional prose that can be injected into prompts to
-      explain how to treat these dependencies (merged by learning-service).
-    """
-    hard: List[str] = []
-    soft: List[str] = []
+    hard: List[str] = Field(default_factory=list)
+    soft: List[str] = Field(default_factory=list)
     context_hint: Optional[str] = None
 
     @field_validator("hard", "soft", mode="before")
@@ -88,45 +118,40 @@ class DependsOnSpec(BaseModel):
             return [str(x) for x in v if x]
         return []
 
+
 # ─────────────────────────────────────────────────────────────
 # Versioned schema entry for a kind
 # ─────────────────────────────────────────────────────────────
 
 class SchemaVersionSpec(BaseModel):
     version: str
-    json_schema: Dict[str, Any]                 # Draft 2020-12 (data-only)
+    json_schema: Dict[str, Any]
     additional_props_policy: Literal["forbid", "allow"] = "forbid"
-    prompt: PromptSpec
-    identity: Optional[IdentitySpec] = None
-    adapters: List[AdapterSpec] = []
-    migrators: List[MigratorSpec] = []
-    examples: List[Dict[str, Any]] = []
 
-    # NEW: explicit inter-kind dependencies for this schema version
+    # Data-generation prompt (JSON)
+    prompt: PromptSpec
+
+    # Diagram recipes for this schema version
+    diagram_recipes: List[DiagramRecipeSpec] = Field(default_factory=list)
+
+    identity: Optional[IdentitySpec] = None
+    adapters: List[AdapterSpec] = Field(default_factory=list)
+    migrators: List[MigratorSpec] = Field(default_factory=list)
+    examples: List[Dict[str, Any]] = Field(default_factory=list)
+
     depends_on: Optional[DependsOnSpec] = None
 
     @field_validator("depends_on", mode="before")
     @classmethod
     def _normalize_depends_on(cls, v):
-        """
-        Accept either:
-          - object form: {"hard":[...], "soft":[...], "context_hint":"..."}
-          - shorthand list: ["cam.workflow.job_flow","cam.code.call_hierarchy"]
-            (normalized to soft deps)
-          - None
-        """
         if v is None:
             return None
         if isinstance(v, list):
-            # Shorthand → soft deps
             return DependsOnSpec(soft=[str(x) for x in v if x])
         if isinstance(v, dict):
-            # Pydantic will construct DependsOnSpec from dict
             return v
         if isinstance(v, str):
-            # Single string shorthand
             return DependsOnSpec(soft=[v])
-        # Unknown shape → ignore gracefully
         return None
 
 
@@ -135,33 +160,28 @@ class SchemaVersionSpec(BaseModel):
 # ─────────────────────────────────────────────────────────────
 
 class KindRegistryDoc(BaseModel):
-    id: str = Field(alias="_id")               # canonical kind id, e.g. "cam.code.legacy_component"
+    id: str = Field(alias="_id")
     title: Optional[str] = None
     summary: Optional[str] = None
     category: Optional[str] = None
-    aliases: List[str] = []
+    aliases: List[str] = Field(default_factory=list)
     status: Literal["active", "deprecated"] = "active"
 
     latest_schema_version: str
     schema_versions: List[SchemaVersionSpec]
 
-    policies: Optional[Dict[str, Any]] = None  # retention/visibility/PII/etc.
+    policies: Optional[Dict[str, Any]] = None
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
-class KindPluginDoc(BaseModel):
-    id: str = Field(alias="_id")               # builtin code id
-    type: Literal["adapter", "migrator"]
-    # metadata only; actual code is part of the service image
-    description: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
-
+# ─────────────────────────────────────────────────────────────
+# NEW: Registry meta model (used by DAL)
+# ─────────────────────────────────────────────────────────────
 
 class RegistryMetaDoc(BaseModel):
-    id: str = Field(default="meta", alias="_id")
-    etag: str                                  # cache-busting token for registry
-    registry_version: int = 1                  # monotonically increasing counter
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    id: str = Field(alias="_id")
+    etag: str
+    registry_version: int = 1
+    updated_at: datetime

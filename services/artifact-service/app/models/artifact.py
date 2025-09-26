@@ -54,6 +54,52 @@ class Lineage(BaseModel):
     superseded_by: Optional[str] = None
 
 
+# ─────────────────────────────────────────────────────────────
+# NEW: embedded diagram representations for an artifact
+# ─────────────────────────────────────────────────────────────
+class DiagramInstance(BaseModel):
+    """
+    A single diagram representation for this artifact.
+    Multiple entries are allowed (e.g., flowchart, sequence, mindmap), possibly in different languages.
+    """
+    # Identity / classification
+    recipe_id: Optional[str] = Field(
+        default=None,
+        description="Registry recipe id if applicable (e.g., 'program.sequence')."
+    )
+    view: Optional[str] = Field(
+        default=None,
+        description="High-level view type (e.g., 'flowchart','sequence','mindmap','activity','er')."
+    )
+    language: str = Field(
+        default="mermaid",
+        description="Diagram language to render with (e.g., mermaid, plantuml, d2, graphviz)."
+    )
+
+    # The actual diagram text to render
+    instructions: str = Field(
+        ...,
+        description="Plain-text diagram instructions in the given language."
+    )
+
+    # Optional rendering hints (direction, theme, width/height, etc.)
+    renderer_hints: Optional[Dict[str, Any]] = None
+
+    # Traceability (for staleness checks)
+    generated_from_fingerprint: Optional[str] = Field(
+        default=None,
+        description="Fingerprint of the artifact data this diagram was generated from."
+    )
+    prompt_rev: Optional[int] = Field(
+        default=None,
+        description="If produced by an LLM prompt recipe, record its prompt_rev."
+    )
+    provenance: Optional[Provenance] = None
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class ArtifactItem(BaseModel):
     """Embedded artifact stored inside the per-workspace parent document."""
     artifact_id: str = Field(default_factory=lambda: str(uuid4()))
@@ -61,9 +107,13 @@ class ArtifactItem(BaseModel):
     name: str
     data: Dict[str, Any]
 
+    # NEW: embedded diagram representations for this artifact
+    diagrams: List[DiagramInstance] = Field(default_factory=list)
+
     # Identity & versioning
     natural_key: Optional[str] = None          # per-kind deterministic key
-    fingerprint: Optional[str] = None          # sha256 over normalized data
+    fingerprint: Optional[str] = None          # sha256 over normalized *data only*
+    diagram_fingerprint: Optional[str] = None  # sha256 over normalized diagrams array
     version: int = 1
     lineage: Optional[Lineage] = None
 
@@ -80,18 +130,21 @@ class ArtifactItemCreate(BaseModel):
     kind: ArtifactKind
     name: str
     data: Dict[str, Any]
+    diagrams: Optional[List[DiagramInstance]] = None  # NEW
     natural_key: Optional[str] = None
-    fingerprint: Optional[str] = None
+    fingerprint: Optional[str] = None                # remains data-only
     provenance: Optional[Provenance] = None
 
 
 class ArtifactItemReplace(BaseModel):
-    data: Dict[str, Any]
+    # Allow replacing either data, diagrams, or both
+    data: Optional[Dict[str, Any]] = None
+    diagrams: Optional[List[DiagramInstance]] = None
     provenance: Optional[Provenance] = None
 
 
 class ArtifactItemPatchIn(BaseModel):
-    # RFC 6902 JSON Patch
+    # RFC 6902 JSON Patch (applies to `.data` only)
     patch: List[Dict[str, Any]]
     provenance: Optional[Provenance] = None
 

@@ -62,6 +62,7 @@ async def upsert_artifact(
             kind=env["kind"],
             name=env["name"],
             data=env["data"],
+            diagrams=body.diagrams,               # NEW: pass diagrams through
             natural_key=env["natural_key"],
             fingerprint=env["fingerprint"],
             provenance=body.provenance,
@@ -126,6 +127,7 @@ async def upsert_batch(
                 kind=env["kind"],
                 name=env["name"],
                 data=env["data"],
+                diagrams=item.diagrams,             # NEW: pass diagrams through
                 natural_key=env["natural_key"],
                 fingerprint=env["fingerprint"],
                 provenance=item.provenance,
@@ -199,15 +201,14 @@ async def set_baseline_inputs(
         logger.exception("set_baseline_inputs_failed", extra={"workspace_id": workspace_id, "err": str(e)})
         raise HTTPException(status_code=500, detail="Failed to set baseline inputs")
 
-    from libs.renova_common.events import Service
     published = True
     if op == "insert":
         published = publish_event_v1(
             org=_org(), service=Service.ARTIFACT, event="baseline_inputs.set",
             payload={
                 "workspace_id": workspace_id,
-                "version": parent.inputs_baseline_version,
-                "fingerprint": parent.inputs_baseline_fingerprint,
+                "version": parent.baseline_version,
+                "fingerprint": parent.baseline_fingerprint,
                 "op": op,
             },
         )
@@ -216,15 +217,15 @@ async def set_baseline_inputs(
             org=_org(), service=Service.ARTIFACT, event="baseline_inputs.replaced",
             payload={
                 "workspace_id": workspace_id,
-                "version": parent.inputs_baseline_version,
-                "fingerprint": parent.inputs_baseline_fingerprint,
+                "version": parent.baseline_version,
+                "fingerprint": parent.baseline_fingerprint,
                 "op": op,
             },
         )
 
     _set_event_header(response, published)
     response.headers["X-Op"] = op
-    response.headers["X-Baseline-Version"] = str(parent.inputs_baseline_version)
+    response.headers["X-Baseline-Version"] = str(parent.baseline_version)
     return parent.model_dump(by_alias=True)
 
 
@@ -255,15 +256,15 @@ async def patch_baseline_inputs(
         org=_org(), service=Service.ARTIFACT, event="baseline_inputs.merged",
         payload={
             "workspace_id": workspace_id,
-            "version": updated.inputs_baseline_version,
-            "fingerprint": updated.inputs_baseline_fingerprint,
+            "version": updated.baseline_version,
+            "fingerprint": updated.baseline_fingerprint,
             "upserts": len(body.fss_stories_upsert or []),
             "replaced_avc": body.avc is not None,
             "replaced_pss": body.pss is not None,
         },
     )
     _set_event_header(response, published)
-    response.headers["X-Baseline-Version"] = str(updated.inputs_baseline_version)
+    response.headers["X-Baseline-Version"] = str(updated.baseline_version)
     return updated.model_dump(by_alias=True)
 
 
@@ -374,7 +375,15 @@ async def replace_artifact(
     expected = _parse_if_match(if_match)
     _guard_if_match(expected, art.version)
 
-    updated = await dal.replace_artifact(db, workspace_id, artifact_id, body.data, body.provenance)
+    # Allow replacing data and/or diagrams
+    updated = await dal.replace_artifact(
+        db,
+        workspace_id,
+        artifact_id,
+        new_data=body.data,
+        prov=body.provenance,
+        new_diagrams=body.diagrams,          # NEW: optional diagrams
+    )
 
     published = publish_event_v1(org=_org(), service=Service.ARTIFACT, event="updated", payload=updated.model_dump())
     response.headers["ETag"] = str(updated.version)
@@ -403,7 +412,14 @@ async def patch_artifact(
         raise HTTPException(status_code=400, detail=f"Invalid patch: {e}")
 
     from_version = art.version
-    updated = await dal.replace_artifact(db, workspace_id, artifact_id, new_data, body.provenance)
+    updated = await dal.replace_artifact(
+        db,
+        workspace_id,
+        artifact_id,
+        new_data=new_data,
+        prov=body.provenance,
+        # diagrams not patched here
+    )
     await dal.record_patch(
         db,
         workspace_id=workspace_id,
