@@ -8,7 +8,7 @@ import re
 import uuid
 from itertools import islice
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Iterable, Tuple
+from typing import Any, Dict, List, Optional, Iterable, Tuple, Set
 
 from app.llms.base import LLMRequest
 from app.llms.registry import build_provider_from_llm_config
@@ -79,7 +79,12 @@ def _is_valid_mermaid(text: str, view: Optional[str] = None) -> bool:
         return bool(re.match(r"^flowchart\s+(TD|LR|BT|RL)\b", s, flags=re.IGNORECASE))
 
     if v == "mindmap":
-        return s.startswith("mindmap")
+        if not s.startswith("mindmap"):
+            return False
+        # Arrows are invalid in mindmap; treat presence as invalid so we repair upstream.
+        if re.search(r"-->", s):
+            return False
+        return True
 
     return bool(re.match(r"^(flowchart|sequenceDiagram|mindmap|classDiagram|stateDiagram|erDiagram)\b", s))
 
@@ -156,6 +161,111 @@ def _cobol_hints(data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# ---------- Mindmap normalization utilities ----------
+
+_EDGE_RE = re.compile(r'^\s*([^-\s].*?)\s*-->\s*([^-\s].*?)\s*$')
+
+def _normalize_mindmap(instr: str) -> str:
+    """
+    Convert any arrow edges into proper indented children, ensure a single root, and
+    remove duplicate/invalid constructs. Prefers a root named 'MAIN' when available.
+    """
+    s = _sanitize_mermaid(instr)
+    if not s.lower().startswith("mindmap"):
+        return s
+
+    lines = [ln.rstrip() for ln in s.splitlines()]
+    # Always start with a single 'mindmap' header
+    content = [ln for ln in lines[1:] if ln.strip()]
+
+    nodes: Set[str] = set()
+    children: Dict[str, List[str]] = {}
+    parents: Dict[str, Set[str]] = {}
+    explicit_roots: List[str] = []
+
+    # Parse hierarchical (indented) relationships
+    stack: List[Tuple[int, str]] = []
+    for ln in content:
+        if "-->" in ln:
+            continue
+        m = re.match(r"^(\s*)(.+)$", ln)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        name = m.group(2).strip()
+        if not name:
+            continue
+        nodes.add(name)
+        if indent == 0:
+            explicit_roots.append(name)
+            stack = [(indent, name)]
+        else:
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            if stack:
+                parent = stack[-1][1]
+                children.setdefault(parent, [])
+                if name not in children[parent]:
+                    children[parent].append(name)
+                parents.setdefault(name, set()).add(parent)
+            stack.append((indent, name))
+
+    # Parse arrow edges (invalid in mindmap, we'll convert)
+    edges: List[Tuple[str, str]] = []
+    for ln in content:
+        m = _EDGE_RE.match(ln)
+        if m:
+            a, b = m.group(1).strip(), m.group(2).strip()
+            if a and b:
+                nodes.add(a); nodes.add(b)
+                edges.append((a, b))
+
+    for a, b in edges:
+        children.setdefault(a, [])
+        if b not in children[a]:
+            children[a].append(b)
+        parents.setdefault(b, set()).add(a)
+
+    # Choose a single root
+    if "MAIN" in nodes:
+        root = "MAIN"
+    else:
+        root_candidates = [n for n in nodes if not parents.get(n)]
+        root = explicit_roots[0] if explicit_roots else (root_candidates[0] if root_candidates else (sorted(nodes)[0] if nodes else "ROOT"))
+
+    # Ensure root has no parent
+    if root in parents:
+        parents.pop(root, None)
+    for p, kids in list(children.items()):
+        if root in kids and p != root:
+            try:
+                kids.remove(root)
+            except ValueError:
+                pass
+
+    # DFS to emit indented tree; avoid cycles and duplicate children
+    visited: Set[str] = set()
+    lines_out: List[str] = ["mindmap"]
+
+    def dfs(node: str, depth: int) -> None:
+        visited.add(node)
+        indent = "  " * (depth + 1)  # first level: two spaces under 'mindmap'
+        lines_out.append(f"{indent}{node}")
+        for child in children.get(node, []):
+            if child in visited:
+                continue
+            dfs(child, depth + 1)
+
+    dfs(root, 0)
+
+    # Attach any disconnected nodes under the root to keep a single tree
+    for n in sorted(nodes):
+        if n not in visited and n != root:
+            dfs(n, 0)
+
+    return "\n".join(lines_out)
+
+
 async def _emit_mermaid_chunked(
     *,
     view: str,
@@ -176,6 +286,15 @@ async def _emit_mermaid_chunked(
         "Use stable, explicit identifiers. Avoid truncation.",
         "If this is NOT the first chunk, DO NOT include the diagram directive; only append lines that fit under the same diagram.",
     ]
+    # Extra guardrails specifically for mindmap syntax
+    if view_header == "mindmap":
+        general_rules.extend([
+            "Mindmap must have exactly ONE root under the 'mindmap' line.",
+            "Mindmap uses INDENTATION to indicate parent/child relationships.",
+            "Do NOT use arrows like 'A --> B' in mindmap. Never.",
+            "Place the root as the first indented line; children are indented beneath their parent by two spaces.",
+        ])
+
     domain_hints = _cobol_hints(data_chunks[0][1])
     if domain_hints:
         general_rules.append(domain_hints)
@@ -216,7 +335,6 @@ async def _emit_mermaid_chunked(
             **base_kwargs,
         )
         try:
-            # Prefer a text endpoint if available; otherwise rely on provider honoring strict_json=False.
             if hasattr(provider, "acomplete_text"):
                 raw = await provider.acomplete_text(req)
             else:
@@ -269,6 +387,10 @@ async def _emit_mermaid_chunked(
         else:
             merged.append(_strip_mermaid_directive(part))
     final = "\n".join(merged).strip()
+
+    # Auto-repair mindmap syntax before validation/logging
+    if view_header == "mindmap":
+        final = _normalize_mindmap(final)
 
     log.info(
         "diagram.emit.final",
