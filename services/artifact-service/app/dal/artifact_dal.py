@@ -4,11 +4,20 @@ from __future__ import annotations
 import json
 import uuid
 import hashlib
-from datetime import datetime
+import base64
+from datetime import datetime, date
+from uuid import UUID
+from decimal import Decimal
 from typing import Optional, List, Dict, Any, Tuple, Iterable
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
+
+try:
+    # Optional: available in typical Mongo stacks
+    from bson import ObjectId  # type: ignore
+except Exception:  # pragma: no cover
+    ObjectId = ()  # type: ignore
 
 from ..models.artifact import (
     ArtifactItem,
@@ -30,15 +39,52 @@ PATCHES = "artifact_patches"
 # Helpers
 # ─────────────────────────────────────────────────────────────
 def _canonical(data: Any) -> str:
-    """Stable JSON for hashing/compare. Removes volatile keys if present."""
-    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+    """
+    Stable JSON for hashing/compare. Tolerates non-JSON-native types to avoid
+    crashes during fingerprinting. Important mappings:
+      - datetime/date -> ISO 8601 string
+      - UUID/ObjectId -> str
+      - bytes/bytearray -> base64 ascii string
+      - Decimal -> str (exact)
+      - set/tuple -> list
+      - fallback -> str(o)
+    """
+    def _json_default(o: Any):
+        if isinstance(o, (datetime, date)):
+            return o.isoformat()
+        if isinstance(o, (UUID,)):
+            return str(o)
+        if ObjectId and isinstance(o, ObjectId):  # noqa: SIM114
+            return str(o)
+        if isinstance(o, (bytes, bytearray)):
+            return base64.b64encode(bytes(o)).decode("ascii")
+        if isinstance(o, Decimal):
+            return str(o)  # preserve exact representation
+        if isinstance(o, (set, tuple)):
+            # Convert to list for JSON; order of a set is undefined, but this is
+            # still better than raising. If a stable order matters, upstream
+            # should provide a list.
+            return list(o)
+        # Last resort: never raise from canonicalization
+        return str(o)
+
+    return json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_default,   # <-- hardening
+        # keep default ensure_ascii=True to avoid changing existing hashes
+    )
+
 
 def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+
 def _fallback_natural_key(kind: str, name: str) -> str:
     """If caller didn't compute per-kind natural key, fall back to kind+name."""
     return f"{kind}:{name}".lower().strip()
+
 
 def _normalize_diagrams(diagrams: Optional[List[DiagramInstance]]) -> List[Dict[str, Any]]:
     """Convert Pydantic models to dicts and normalize missing → []."""

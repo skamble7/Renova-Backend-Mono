@@ -68,6 +68,7 @@ class ArtifactServiceClient:
         params: Optional[Dict[str, Any]] = None,
         json: Optional[Dict[str, Any]] = None,
         correlation_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> Any:
         headers = {
             "Accept": "application/json",
@@ -76,6 +77,8 @@ class ArtifactServiceClient:
         }
         if correlation_id:
             headers["X-Correlation-ID"] = correlation_id
+        if run_id:
+            headers["X-Run-Id"] = str(run_id)
 
         url = f"{self.base_url}{path}"
         resp = await self._client.request(method, url, params=params, json=json, headers=headers)
@@ -188,6 +191,7 @@ class ArtifactServiceClient:
         items: List[Dict[str, Any]],
         *,
         correlation_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         POST /artifact/{workspace_id}/upsert-batch
@@ -195,7 +199,13 @@ class ArtifactServiceClient:
         Returns a summary dict (counts, results) per artifact-service contract.
         """
         body = {"items": items}
-        return await self._request("POST", f"/artifact/{workspace_id}/upsert-batch", json=body, correlation_id=correlation_id)
+        return await self._request(
+            "POST",
+            f"/artifact/{workspace_id}/upsert-batch",
+            json=body,
+            correlation_id=correlation_id,
+            run_id=run_id,
+        )
 
     async def get_deltas(
         self,

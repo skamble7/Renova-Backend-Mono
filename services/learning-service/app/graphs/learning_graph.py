@@ -13,6 +13,7 @@ from app.graphs.nodes.prepare_context_node import prepare_context_node
 from app.graphs.nodes.exec_mcp_node import exec_mcp_node
 from app.graphs.nodes.exec_llm_node import exec_llm_node
 from app.graphs.nodes.validate_node import validate_node
+from app.graphs.nodes.diagram_node import diagram_node
 from app.graphs.nodes.diff_node import diff_node
 from app.graphs.nodes.audit_node import audit_node
 from app.graphs.nodes.finalize_node import finalize_node
@@ -67,6 +68,7 @@ def build_graph(initial_state: Dict[str, Any]):
         exec_llm_name = f"{skey}.exec.llm"
         exec_mcp_name = f"{skey}.exec.mcp"
         validate_name = f"{skey}.validate"
+        diagram_name = f"{skey}.diagram"
         gate_name = f"{skey}.gate"
 
         graph.add_node(set_idx_name, make_set_index_node(i))
@@ -74,6 +76,7 @@ def build_graph(initial_state: Dict[str, Any]):
         graph.add_node(exec_llm_name, exec_llm_node)
         graph.add_node(exec_mcp_name, exec_mcp_node)
         graph.add_node(validate_name, validate_node)
+        graph.add_node(diagram_name, diagram_node)
         graph.add_node(gate_name, gate_produced_node)
 
         graph.add_edge(prev_tail, set_idx_name)
@@ -95,7 +98,10 @@ def build_graph(initial_state: Dict[str, Any]):
 
         graph.add_edge(exec_mcp_name, validate_name)
         graph.add_edge(exec_llm_name, validate_name)
-        graph.add_edge(validate_name, gate_name)
+
+        # NEW: generate optional per-artifact diagrams after validation
+        graph.add_edge(validate_name, diagram_name)
+        graph.add_edge(diagram_name, gate_name)
 
         prev_tail = gate_name
 
