@@ -16,12 +16,11 @@ from app.llms.registry import build_provider_from_llm_config
 log = logging.getLogger("app.diagrams.generator")
 
 # Prompt sizing
-_MAX_DATA_CHARS = 16000     # overall guardrail
-_CHUNK_TARGET = 9000        # per-LLM call payload target (leave room for instructions/tokens)
-_MIN_CHUNK = 4000           # don't over-fragment tiny payloads
-_PREVIEW_CHARS = 600        # how many instruction chars to log
+_MAX_DATA_CHARS = 16000
+_CHUNK_TARGET = 9000
+_MIN_CHUNK = 4000
+_PREVIEW_CHARS = 600
 
-# Optional: dump final mermaid to files for offline inspection
 def _truthy_env(val: Optional[str]) -> bool:
     return str(val or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -45,14 +44,12 @@ def _preview(s: str, n: int = _PREVIEW_CHARS) -> str:
 def _sanitize_mermaid(text: str) -> str:
     s = (text or "").strip()
     if s.startswith("```"):
-        # strip code fences
         s = re.sub(r"^```[a-zA-Z0-9]*\s*", "", s)
         s = re.sub(r"\s*```$", "", s)
     return s.strip()
 
 
 def _strip_mermaid_directive(body: str) -> str:
-    """Remove any leading diagram directive if the model repeats it in later chunks."""
     s = _sanitize_mermaid(body)
     s = re.sub(
         r"^(flowchart\s+(TD|LR|BT|RL)\b|sequenceDiagram\b|mindmap\b|classDiagram\b|stateDiagram\b|erDiagram\b)[^\n]*\n?",
@@ -73,7 +70,7 @@ def _is_valid_mermaid(text: str, view: Optional[str] = None) -> bool:
     v = (view or "").strip().lower()
 
     if v in {"sequence", "sequencediagram"}:
-        return bool(s.startswith("sequenceDiagram"))
+        return s.startswith("sequenceDiagram")
 
     if v in {"flow", "flowchart"}:
         return bool(re.match(r"^flowchart\s+(TD|LR|BT|RL)\b", s, flags=re.IGNORECASE))
@@ -81,7 +78,6 @@ def _is_valid_mermaid(text: str, view: Optional[str] = None) -> bool:
     if v == "mindmap":
         if not s.startswith("mindmap"):
             return False
-        # Arrows are invalid in mindmap; treat presence as invalid so we repair upstream.
         if re.search(r"-->", s):
             return False
         return True
@@ -161,21 +157,16 @@ def _cobol_hints(data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-# ---------- Mindmap normalization utilities ----------
+# ---------- Mindmap normalization ----------
 
 _EDGE_RE = re.compile(r'^\s*([^-\s].*?)\s*-->\s*([^-\s].*?)\s*$')
 
 def _normalize_mindmap(instr: str) -> str:
-    """
-    Convert any arrow edges into proper indented children, ensure a single root, and
-    remove duplicate/invalid constructs. Prefers a root named 'MAIN' when available.
-    """
     s = _sanitize_mermaid(instr)
     if not s.lower().startswith("mindmap"):
         return s
 
     lines = [ln.rstrip() for ln in s.splitlines()]
-    # Always start with a single 'mindmap' header
     content = [ln for ln in lines[1:] if ln.strip()]
 
     nodes: Set[str] = set()
@@ -183,7 +174,6 @@ def _normalize_mindmap(instr: str) -> str:
     parents: Dict[str, Set[str]] = {}
     explicit_roots: List[str] = []
 
-    # Parse hierarchical (indented) relationships
     stack: List[Tuple[int, str]] = []
     for ln in content:
         if "-->" in ln:
@@ -210,7 +200,6 @@ def _normalize_mindmap(instr: str) -> str:
                 parents.setdefault(name, set()).add(parent)
             stack.append((indent, name))
 
-    # Parse arrow edges (invalid in mindmap, we'll convert)
     edges: List[Tuple[str, str]] = []
     for ln in content:
         m = _EDGE_RE.match(ln)
@@ -226,16 +215,13 @@ def _normalize_mindmap(instr: str) -> str:
             children[a].append(b)
         parents.setdefault(b, set()).add(a)
 
-    # Choose a single root
     if "MAIN" in nodes:
         root = "MAIN"
     else:
         root_candidates = [n for n in nodes if not parents.get(n)]
         root = explicit_roots[0] if explicit_roots else (root_candidates[0] if root_candidates else (sorted(nodes)[0] if nodes else "ROOT"))
 
-    # Ensure root has no parent
-    if root in parents:
-        parents.pop(root, None)
+    parents.pop(root, None)
     for p, kids in list(children.items()):
         if root in kids and p != root:
             try:
@@ -243,27 +229,135 @@ def _normalize_mindmap(instr: str) -> str:
             except ValueError:
                 pass
 
-    # DFS to emit indented tree; avoid cycles and duplicate children
     visited: Set[str] = set()
-    lines_out: List[str] = ["mindmap"]
+    out: List[str] = ["mindmap"]
 
     def dfs(node: str, depth: int) -> None:
         visited.add(node)
-        indent = "  " * (depth + 1)  # first level: two spaces under 'mindmap'
-        lines_out.append(f"{indent}{node}")
+        indent = "  " * (depth + 1)
+        out.append(f"{indent}{node}")
         for child in children.get(node, []):
             if child in visited:
                 continue
             dfs(child, depth + 1)
 
-    dfs(root, 0)
+    if nodes:
+        dfs(root, 0)
+        for n in sorted(nodes):
+            if n not in visited and n != root:
+                dfs(n, 0)
+    else:
+        out.append("  MAIN")
 
-    # Attach any disconnected nodes under the root to keep a single tree
-    for n in sorted(nodes):
-        if n not in visited and n != root:
-            dfs(n, 0)
+    return "\n".join(out)
 
-    return "\n".join(lines_out)
+
+# ---------- Sequence diagram normalization ----------
+
+_ARROW_PATTERNS = ["-->>", "->>", "-->", "->"]  # prefer longest first
+
+def _safe_seq_id(name: str) -> str:
+    raw = name.strip()
+    # Replace non-word with underscores; collapse repeats
+    cleaned = re.sub(r"\W+", "_", raw)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    if not cleaned:
+        cleaned = "P"
+    if not re.match(r"[A-Za-z_]", cleaned):
+        cleaned = f"P_{cleaned}"
+    return cleaned
+
+def _normalize_sequence(instr: str) -> str:
+    s = _sanitize_mermaid(instr)
+    if not s.startswith("sequenceDiagram"):
+        return s
+
+    lines = [ln.rstrip() for ln in s.splitlines()]
+    body = lines[1:]  # after header
+
+    msgs: List[str] = []
+    extras: List[str] = []
+    actors: List[str] = []
+    alias_map: Dict[str, str] = {}
+
+    def parse_message_line(ln: str) -> Optional[str]:
+        # Find arrow token
+        idx = -1
+        arrow = ""
+        for pat in _ARROW_PATTERNS:
+            i = ln.find(pat)
+            if i != -1:
+                idx = i
+                arrow = pat
+                break
+        if idx == -1:
+            return None
+
+        left = ln[:idx].strip()
+        rest = ln[idx + len(arrow):].strip()
+        if not left:
+            return None  # cannot recover: missing sender
+
+        # Receiver + optional ": message"
+        if ":" in rest:
+            recv, msg = rest.split(":", 1)
+            recv = recv.strip()
+            msg = msg.strip()
+        else:
+            # Heuristic: first token is receiver; remaining becomes message (if any)
+            parts = rest.split()
+            if not parts:
+                recv, msg = "", ""
+            elif len(parts) == 1:
+                recv, msg = parts[0], ""
+            else:
+                recv, msg = parts[0], " ".join(parts[1:])
+
+        if not recv:
+            return None
+
+        # Sanitize actors and register
+        s_id = alias_map.setdefault(left, _safe_seq_id(left))
+        r_id = alias_map.setdefault(recv, _safe_seq_id(recv))
+        if s_id not in actors:
+            actors.append(s_id)
+        if r_id not in actors:
+            actors.append(r_id)
+
+        # Ensure message text exists
+        msg = msg if msg else "call"
+        return f"{s_id}{arrow}{r_id}: {msg}"
+
+    # Collect messages and other lines (notes, loops, etc.)
+    for ln in body:
+        if not ln.strip():
+            continue
+        if ln.strip().startswith("participant "):
+            # skip existing participants; we'll re-emit
+            continue
+        mm = parse_message_line(ln)
+        if mm:
+            msgs.append(mm)
+        else:
+            extras.append(ln)
+
+    # Build participants with alias when sanitized changed
+    decls: List[str] = []
+    # Preserve insertion order of alias_map
+    for orig, sid in alias_map.items():
+        if sid == orig:
+            decls.append(f'participant {sid}')
+        else:
+            decls.append(f'participant {sid} as "{orig}"')
+
+    out: List[str] = ["sequenceDiagram"]
+    out.extend(decls)
+    # Optional: autonumber (comment out if undesired)
+    # out.append("autonumber")
+    out.extend(msgs)
+    out.extend(extras)  # keep remaining constructs (notes, opt/alt blocks, etc.)
+
+    return "\n".join(out)
 
 
 async def _emit_mermaid_chunked(
@@ -286,13 +380,18 @@ async def _emit_mermaid_chunked(
         "Use stable, explicit identifiers. Avoid truncation.",
         "If this is NOT the first chunk, DO NOT include the diagram directive; only append lines that fit under the same diagram.",
     ]
-    # Extra guardrails specifically for mindmap syntax
     if view_header == "mindmap":
         general_rules.extend([
             "Mindmap must have exactly ONE root under the 'mindmap' line.",
             "Mindmap uses INDENTATION to indicate parent/child relationships.",
             "Do NOT use arrows like 'A --> B' in mindmap. Never.",
-            "Place the root as the first indented line; children are indented beneath their parent by two spaces.",
+            "Place the root as the first indented line; children indented by two spaces per level.",
+        ])
+    if view_header == "sequenceDiagram":
+        general_rules.extend([
+            "Every message MUST have text after the arrow, e.g., 'A->>B: call'.",
+            "Avoid spaces/hyphens in actor IDs; prefer letters, digits, underscores.",
+            "If an actor label starts with a digit or contains symbols, map to a safe ID and declare 'participant SAFE as \"Original\"'.",
         ])
 
     domain_hints = _cobol_hints(data_chunks[0][1])
@@ -329,14 +428,15 @@ async def _emit_mermaid_chunked(
             system_prompt=system,
             user_prompt=ask,
             json_schema=None,
-            strict_json=False,  # we want plain text (Mermaid), not JSON
+            strict_json=False,
             temperature=temperature,
             max_tokens=max_tokens,
             **base_kwargs,
         )
         try:
+            # Prefer text API if provider offers it
             if hasattr(provider, "acomplete_text"):
-                raw = await provider.acomplete_text(req)
+                raw = await provider.acomplete_text(req)  # type: ignore[attr-defined]
             else:
                 raw = await provider.acomplete_json(req)
         except Exception:
@@ -347,7 +447,6 @@ async def _emit_mermaid_chunked(
             )
             return None
 
-        # Some providers might return dict/list; coerce to string defensively
         if isinstance(raw, dict):
             s = _sanitize_mermaid(str(raw.get("text") or ""))
             shape = "dict"
@@ -382,15 +481,14 @@ async def _emit_mermaid_chunked(
 
     merged = []
     for j, part in enumerate(composed, start=1):
-        if j == 1:
-            merged.append(part)
-        else:
-            merged.append(_strip_mermaid_directive(part))
+        merged.append(part if j == 1 else _strip_mermaid_directive(part))
     final = "\n".join(merged).strip()
 
-    # Auto-repair mindmap syntax before validation/logging
+    # Auto-repair syntax before validation/logging
     if view_header == "mindmap":
         final = _normalize_mindmap(final)
+    elif view_header == "sequenceDiagram":
+        final = _normalize_sequence(final)
 
     log.info(
         "diagram.emit.final",
@@ -403,7 +501,7 @@ async def _emit_mermaid_chunked(
             path = _DUMP_DIR / f"{stem}.mmd"
             path.write_text(final, encoding="utf-8")
             log.info("diagram.dump.saved", extra={"path": str(path), "bytes": len(final)})
-        except Exception:  # never break the run on dump issues
+        except Exception:
             log.warning("diagram.dump.failed", exc_info=True)
 
     return final
@@ -414,13 +512,8 @@ async def generate_diagrams_for_artifact(
     kind_doc: Dict[str, Any],
     data: Dict[str, Any],
     llm_config: Optional[Dict[str, Any]] = None,
-    dump_key: Optional[str] = None,  # e.g., f"{run_id}_{artifact_name}"
+    dump_key: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Read the kind's latest schema version and produce Mermaid diagrams using ONLY the recipe `view`.
-    - Templates are ignored for now.
-    - If the artifact data is large, we chunk and compose one diagram per recipe.
-    """
     latest = str(kind_doc.get("latest_schema_version") or "1.0.0")
     sv = next((x for x in (kind_doc.get("schema_versions") or []) if str(x.get("version")) == latest), {}) or {}
     recipes = list(sv.get("diagram_recipes") or [])
