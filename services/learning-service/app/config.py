@@ -66,7 +66,7 @@ class Settings:
 
             mcp_http_timeout=float(os.getenv("MCP_HTTP_TIMEOUT", "60")),
             mcp_stdio_kill_timeout=int(os.getenv("MCP_STDIO_KILL_TIMEOUT", "10")),
-            mcp_stdio_startup_timeout=int(os.getenv("MCP_STDIO_STARTUP_TIMEOUT", "20")),
+            mcp_stdio_startup_timeout=int(os.getenv("MCP_STDIO_STARTUP_TIMEOUT", "60")),
             mcp_retry_max_attempts=int(os.getenv("MCP_RETRY_MAX_ATTEMPTS", "2")),
             mcp_retry_backoff_ms=int(os.getenv("MCP_RETRY_BACKOFF_MS", "250")),
         )

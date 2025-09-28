@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+from subprocess import TimeoutExpired
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -18,7 +19,8 @@ _PARA_LABEL_RE  = re.compile(r"(?m)^(?P<indent>\s{0,8})(?P<name>[A-Za-z0-9][A-Za
 # Statement finders used inside blocks
 _PERFORM_RE     = re.compile(r"\bPERFORM\s+([A-Za-z0-9][A-Za-z0-9-]*)\b", re.IGNORECASE)
 _CALL_RE        = re.compile(r"\bCALL\s+(?:\"|')?([A-Za-z0-9][A-Za-z0-9-]*)(?:\"|')?\b", re.IGNORECASE)
-_COPY_RE        = re.compile(r"\bCOPY\s+([A-Za-z0-9][A-Za-z0-9-]*)\b", re.IGNORECASE)
+_COPY_RE        = re.compile(r"(?im)^\s*COPY\s+([A-Za-z0-9][A-Za-z0-9-]*)\s*\.\s*$", re.IGNORECASE)
+# Capture a superset; we'll filter to schema-allowed ops in _normalize_io_ops.
 _IO_RE          = re.compile(r"\b(OPEN|CLOSE|READ|WRITE|REWRITE|DELETE|START)\b", re.IGNORECASE)
 
 # Division sentinels
@@ -27,18 +29,36 @@ _DIV_ENV     = re.compile(r"(?im)^\s*ENVIRONMENT\s+DIVISION\.", re.MULTILINE)
 _DIV_DATA    = re.compile(r"(?im)^\s*DATA\s+DIVISION\.", re.MULTILINE)
 _DIV_PROC    = re.compile(r"(?im)^\s*PROCEDURE\s+DIVISION\.", re.MULTILINE)
 
-@lru_cache(maxsize=1024)
-def _read_copy_candidate(abs_path: str) -> Optional[str]:
+# Only these I/O ops are allowed by the cam.cobol.program schema
+_ALLOWED_IO = {"READ", "WRITE", "OPEN", "CLOSE", "REWRITE"}
+
+def _java_timeout_seconds() -> float:
+    """Global hard cap for each Java CLI attempt (stdin/file)."""
     try:
-        with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
+        return float(os.environ.get("COBOL_JAVA_TIMEOUT_SEC", "8"))
+    except Exception:
+        return 8.0
+
+@lru_cache(maxsize=1024)
+def _read_copy_candidate(abs_path: str, max_bytes: int = 1_000_000) -> Optional[str]:
+    """
+    Read a candidate COPY file with a size cap (default 1MB) to avoid
+    blowing up parser input size on naive include.
+    """
+    try:
+        with open(abs_path, "rb") as f:
+            b = f.read(max_bytes + 1)
+        if len(b) > max_bytes:
+            return None  # skip overly large includes
+        return b.decode("utf-8", errors="ignore")
     except Exception:
         return None
 
 def _expand_copys(text: str, relpath: str, copy_dirs: List[str]) -> str:
     """
-    Very small include preprocessor for `COPY NAME.` lines.
-    Supports bare `COPY NAME.` lines. Does NOT implement REPLACING.
+    Small include preprocessor for *simple* `COPY NAME.` lines (no REPLACING).
+    - If found on disk: inline.
+    - If NOT found: replace the COPY line with a benign comment so ProLeap doesn’t fail.
     """
     if not copy_dirs:
         return text
@@ -46,8 +66,8 @@ def _expand_copys(text: str, relpath: str, copy_dirs: List[str]) -> str:
     lines = text.splitlines(keepends=True)
     out: List[str] = []
     for ln in lines:
-        m = _COPY_RE.search(ln)
-        if m and ln.strip().upper().endswith("."):
+        m = _COPY_RE.match(ln)
+        if m:
             name = m.group(1)
             # try NAME.cpy / NAME.CPY / NAME.copy / NAME.COPY
             candidates: List[str] = []
@@ -65,18 +85,23 @@ def _expand_copys(text: str, relpath: str, copy_dirs: List[str]) -> str:
                 out.append(f"      *COPY {name}*.\n")
                 out.append(included if included.endswith("\n") else included + "\n")
                 continue
+            else:
+                # Missing copybook → keep a harmless comment in place of the COPY
+                out.append(f"      *COPY {name} (missing; skipped for parse)*.\n")
+                continue
         out.append(ln)
     return "".join(out)
 
 # --- neutralize unsupported EXEC blocks for ProLeap (IMS, DLI, etc.) ---
 _EXEC_BLOCKS = [
-    re.compile(r"(?is)^\s*EXEC\s+DLI\b.*?END-EXEC\s*\.", re.MULTILINE),
-    re.compile(r"(?is)^\s*EXEC\s+IMS\b.*?END-EXEC\s*\.", re.MULTILINE),
+    re.compile(r"(?is)^\s*EXEC\s+DLI\b.*?END-EXEC\s*\.?", re.MULTILINE),
+    re.compile(r"(?is)^\s*EXEC\s+IMS\b.*?END-EXEC\s*\.?", re.MULTILINE),
 ]
 def _neutralize_unsupported_execs(src: str) -> str:
+    # Replace whole EXEC…END-EXEC blocks with a no-op that keeps the period.
     out = src
     for pat in _EXEC_BLOCKS:
-        out = pat.sub("    CONTINUE.", out)
+        out = pat.sub("    CONTINUE.\n", out)
     return out
 
 def _should_dump(dump_raw_flag: bool) -> bool:
@@ -100,8 +125,12 @@ def _dump_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def _normalize_io_ops(tokens: List[str]) -> List[Dict[str, Any]]:
-    # Shape for schema: {"op": "...", "dataset_ref": "", "fields": []}
-    return [{"op": tok.upper(), "dataset_ref": "", "fields": []} for tok in tokens]
+    """
+    Keep only schema-allowed ops; drop others (e.g., START, DELETE) to avoid
+    validation errors like "'START' is not one of …". See run logs. 
+    """
+    filtered = [tok.upper() for tok in tokens if tok.upper() in _ALLOWED_IO]
+    return [{"op": tok, "dataset_ref": "", "fields": []} for tok in filtered]
 
 # --------- enrichment from raw source: blocks, edges, divisions ----------
 def _paragraph_blocks(text: str) -> List[Tuple[str, int, int]]:
@@ -225,6 +254,26 @@ class ProLeapAdapter:
                 ast["_io_ops_all"] = _normalize_io_ops(io_all)
                 return ast
 
+        # --- Fallback: sanitize EXEC blocks then retry ProLeap once ---
+        if any(p.search(text) for p in _EXEC_BLOCKS):
+            sanitized = _neutralize_unsupported_execs(text)
+            xml_str, attempts2, raw_out2 = self._run_proleap(sanitized, dialect, relpath)
+            if want_dump:
+                _dump_json(_dump_path_for(relpath, "proleap_sanitized", ".attempts.json"), attempts2)
+                if xml_str:
+                    _dump_text(_dump_path_for(relpath, "proleap_sanitized", ".xml"), xml_str)
+                elif raw_out2:
+                    _dump_text(_dump_path_for(relpath, "proleap_sanitized", ".txt"), raw_out2)
+            if xml_str:
+                ast = self._from_proleap_program(xml_str, relpath) or {}
+                # Enrich as above
+                paragraphs, calls_all, io_all = _edges_from_text(sanitized)
+                ast["paragraphs"] = paragraphs or [{"name": "MAIN", "performs": [], "calls": [], "io_ops": []}]
+                ast["divisions"] = _detect_divisions(sanitized, ast.get("program_id"))
+                ast["_calls_all"] = calls_all
+                ast["_io_ops_all"] = _normalize_io_ops(io_all)
+                return ast
+
         # --- Fallback: cb2xml (program) ---
         xml_str, attempts, raw_out = self._run_cb2xml(text, dialect, relpath, is_copybook=False)
         if want_dump:
@@ -240,8 +289,6 @@ class ProLeapAdapter:
                 if want_dump:
                     ast["_raw_dump_path"] = str(_dump_path_for(relpath, "cb2xml_prog", ".xml"))
                 ast.pop("notes", None)
-
-                # Enrich edges & divisions from text
                 paragraphs, calls_all, io_all = _edges_from_text(text)
                 ast["paragraphs"] = paragraphs or ast.get("paragraphs") or [{"name": "MAIN", "performs": [], "calls": [], "io_ops": []}]
                 ast["divisions"] = _detect_divisions(text, ast.get("program_id"))
@@ -305,16 +352,10 @@ class ProLeapAdapter:
     # ------------------------- Java runners -------------------------
 
     def _run_proleap(self, cobol_src: str, dialect: str, relpath: str) -> Tuple[Optional[str], list, str]:
-        """
-        Run ProLeap via classpath. Prefer the bridge CLI (com.renova.proleap.CLI).
-        Accepts stdin if supported, else temp-file mode.
-
-        Returns: (xml_or_none, attempts[], raw_combined_text)
-        """
         attempts: List[Dict[str, Any]] = []
         combined_text_out = ""
+        timeout_s = _java_timeout_seconds()
 
-        # Prefer the bridge jar & main.
         cp = (os.environ.get("PROLEAP_CLASSPATH") or "/opt/proleap/lib/proleap-cli-bridge.jar").strip()
         main = (os.environ.get("PROLEAP_MAIN") or "com.renova.proleap.CLI").strip()
         mains = [m for m in [main] if m]
@@ -326,10 +367,14 @@ class ProLeapAdapter:
             cmd = ["java", "-cp", cp, mains[0], "-stdin"]
             attempts.append({"mode": "stdin", "cmd": cmd, "tag": tag})
             try:
-                out = subprocess.check_output(cmd, input=src.encode("utf-8"),
-                                              stderr=subprocess.STDOUT, env=env)
+                out = subprocess.check_output(
+                    cmd, input=src.encode("utf-8"),
+                    stderr=subprocess.STDOUT, env=env, timeout=timeout_s
+                )
                 s = out.decode("utf-8", errors="replace")
                 return (s if s.strip().startswith("<") else None, f"\n# {cmd}\n{s}\n")
+            except TimeoutExpired:
+                return (None, f"\n# {cmd} TIMEOUT after {timeout_s}s\n")
             except subprocess.CalledProcessError as e:
                 msg = e.output.decode("utf-8", errors="replace") if e.output else str(e)
                 return (None, f"\n# {cmd} FAILED (exit {e.returncode}):\n{msg}\n")
@@ -346,11 +391,13 @@ class ProLeapAdapter:
                     cmd = ["java", "-cp", cp, mains[0], *args]
                     attempts.append({"mode": "file", "cmd": cmd, "tag": tag})
                     try:
-                        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env)
+                        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env, timeout=timeout_s)
                         s = out.decode("utf-8", errors="replace")
                         out_log += f"\n# {cmd}\n{s}\n"
                         if s.strip().startswith("<"):
                             return s, out_log
+                    except TimeoutExpired:
+                        out_log += f"\n# {cmd} TIMEOUT after {timeout_s}s\n"
                     except subprocess.CalledProcessError as e:
                         msg = e.output.decode("utf-8", errors="replace") if e.output else str(e)
                         out_log += f"\n# {cmd} FAILED (exit {e.returncode}):\n{msg}\n"
@@ -363,7 +410,6 @@ class ProLeapAdapter:
                     pass
             return None, out_log
 
-        # 1) Try original source via stdin, then file
         s, log = _try_stdin(cobol_src, "original")
         combined_text_out += log
         if s:
@@ -374,10 +420,8 @@ class ProLeapAdapter:
         if s:
             return s, attempts, combined_text_out
 
-        # 2) If IMS markers detected, sanitize and retry once
-        if any(p.search(cobol_src) for p in _EXEC_BLOCKS) or \
-           "EXEC DLI" in cobol_src.upper() or "EXEC IMS" in cobol_src.upper() or \
-           "EXEC DLI" in combined_text_out.upper() or "EXEC IMS" in combined_text_out.upper():
+        # If IMS/DLI is present, try a sanitized retry
+        if any(p.search(cobol_src) for p in _EXEC_BLOCKS):
             sanitized = _neutralize_unsupported_execs(cobol_src)
             s, log = _try_stdin(sanitized, "sanitized_exec")
             combined_text_out += log
@@ -394,6 +438,7 @@ class ProLeapAdapter:
     def _run_cb2xml(self, cobol_src: str, dialect: str, relpath: str, is_copybook: bool) -> tuple[Optional[str], list, str]:
         attempts: List[Dict[str, Any]] = []
         combined_text_out = ""
+        timeout_s = _java_timeout_seconds()
 
         cp = os.environ.get("CB2XML_CLASSPATH", "").strip() or "/opt/cb2xml/lib/*"
         mains = [os.environ.get("CB2XML_MAIN", "").strip()] if os.environ.get("CB2XML_MAIN") else []
@@ -411,12 +456,14 @@ class ProLeapAdapter:
                 try:
                     out = subprocess.check_output(
                         cmd, input=cobol_src.encode("utf-8"),
-                        stderr=subprocess.STDOUT, env=env
+                        stderr=subprocess.STDOUT, env=env, timeout=timeout_s
                     )
                     s = out.decode("utf-8", errors="replace")
                     combined_text_out += f"\n# {cmd}\n{s}\n"
                     if s.strip().startswith("<"):
                         return s, attempts, combined_text_out
+                except TimeoutExpired:
+                    combined_text_out += f"\n# {cmd} TIMEOUT after {timeout_s}s\n"
                 except subprocess.CalledProcessError as e:
                     msg = e.output.decode("utf-8", errors="replace") if e.output else str(e)
                     combined_text_out += f"\n# {cmd} FAILED (exit {e.returncode}):\n{msg}\n"
@@ -435,11 +482,13 @@ class ProLeapAdapter:
                     cmd = ["java", "-cp", cp, main, *args]
                     attempts.append({"mode": "file", "cmd": cmd, "is_copybook": is_copybook})
                     try:
-                        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env)
+                        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env, timeout=timeout_s)
                         s = out.decode("utf-8", errors="replace")
                         combined_text_out += f"\n# {cmd}\n{s}\n"
-                        if s.strip().startswith("<"):
+                        if s.strip().startsWith("<"):  # tolerate variants
                             return s, attempts, combined_text_out
+                    except TimeoutExpired:
+                        combined_text_out += f"\n# {cmd} TIMEOUT after {timeout_s}s\n"
                     except subprocess.CalledProcessError as e:
                         msg = e.output.decode("utf-8", errors="replace") if e.output else str(e)
                         combined_text_out += f"\n# {cmd} FAILED (exit {e.returncode}):\n{msg}\n"
@@ -454,11 +503,9 @@ class ProLeapAdapter:
         return None, attempts, combined_text_out.strip()
 
     # ------------------------- XML → AST -------------------------
+    # (unchanged below except for minor robustness)
 
     def _from_proleap_program(self, xml_str: str, relpath: str) -> Optional[Dict[str, Any]]:
-        """
-        ProLeap XML varies by version; be defensive.
-        """
         try:
             root = ET.fromstring(xml_str)
         except ET.ParseError:
@@ -532,12 +579,33 @@ class ProLeapAdapter:
         except ET.ParseError:
             return None
 
-        items: List[Dict[str, Any]] = []
-        for node in root.findall(".//*"):
-            level = (node.get("level") or "").strip()
-            name  = (node.get("name") or node.get("fieldname") or (node.text or "")).strip()
-            if level == "01" and name:
-                items.append({"level": "01", "name": name.upper(), "picture": "", "children": []})
+        def _mk_item(n: ET.Element) -> Dict[str, Any]:
+            level = (n.get("level") or n.get("lvl") or "").strip()
+            name  = (n.get("name") or n.get("fieldname") or "").strip()
+            pic   = (n.get("picture") or n.get("pic") or "").strip()
+            occurs_txt = (n.get("occurs") or n.get("OCCURS") or "").strip()
+            try:
+                occurs = int(occurs_txt) if occurs_txt else None
+            except Exception:
+                occurs = None
+
+            item: Dict[str, Any] = {
+                "level": level or "",
+                "name": name.upper() if name else "",
+                "picture": pic,
+                "children": [],
+            }
+            if occurs is not None:
+                item["occurs"] = occurs
+
+            for c in n.findall("./item"):
+                child = _mk_item(c)
+                if child.get("name"):
+                    item["children"].append(child)
+            return item
+
+        top = root.findall(".//item[@level='01']") or root.findall("./item")
+        items = [_mk_item(n) for n in top if (n.get("level") or n.get("lvl"))]
         return items or None
 
     # ------------------------- Heuristics -------------------------
@@ -567,7 +635,9 @@ class ProLeapAdapter:
         return m.group(1).upper() if m else None
 
     def _find_copybooks(self, text: str) -> List[str]:
-        return sorted({m.group(1).upper() for m in _COPY_RE.finditer(text)})
+        # Re-scan with tolerant matcher (not anchored) for diagnostics
+        m = re.finditer(r"\bCOPY\s+([A-Za-z0-9][A-Za-z0-9-]*)\b", text, flags=re.IGNORECASE)
+        return sorted({g.group(1).upper() for g in m})
 
     def _find_xml_text(self, root: Optional[ET.Element], candidates: List[str]) -> Optional[str]:
         if root is None:

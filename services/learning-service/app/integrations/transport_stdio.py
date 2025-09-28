@@ -64,7 +64,7 @@ class StdioTransport:
         self.restart_on_exit = bool(t.get("restart_on_exit", True))
         self.readiness_regex = subst(t.get("readiness_regex") or None)
         self.kill_timeout_sec = int(t.get("kill_timeout_sec") or os.getenv("MCP_STDIO_KILL_TIMEOUT", "10"))
-        self.startup_timeout_sec = int(os.getenv("MCP_STDIO_STARTUP_TIMEOUT", "20"))
+        self.startup_timeout_sec = int(os.getenv("MCP_STDIO_STARTUP_TIMEOUT", "60"))
 
         # Process & IO
         self._proc: Optional[Process] = None

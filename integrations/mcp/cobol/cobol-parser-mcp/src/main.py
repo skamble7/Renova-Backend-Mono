@@ -29,25 +29,15 @@ signal.signal(signal.SIGINT, _sigterm_handler)
 
 # --------------------------- Path Normalizer ---------------------------
 def _normalize_root(root: str) -> str:
-    """
-    Map a host path to the container mount so the tool works across
-    local dev, UAT, and prod.
-
-    Env vars:
-      WORKSPACE_HOST: absolute host path (e.g. /Users/alice/Projects/Renova)
-      WORKSPACE_CONTAINER: mount path inside container (default: /mnt/work)
-    """
     if not root:
         return root
 
     ws_host = os.environ.get("WORKSPACE_HOST")
     ws_ctr = os.environ.get("WORKSPACE_CONTAINER", "/mnt/work")
 
-    # Already container-relative?
     if root.startswith(ws_ctr):
         return root
 
-    # Normalize Windows-style paths C:\\foo\\bar → /c/foo/bar
     r = root
     if re.match(r"^[A-Za-z]:\\", r):
         drive, rest = r[:2], r[2:]
@@ -55,18 +45,15 @@ def _normalize_root(root: str) -> str:
     else:
         r = r.replace("\\", "/")
 
-    # Replace workspace host prefix with container prefix
     if ws_host:
         ws_host_norm = ws_host.replace("\\", "/").rstrip("/")
         if r.startswith(ws_host_norm + "/") or r == ws_host_norm:
             suffix = r[len(ws_host_norm):].lstrip("/")
             return os.path.join(ws_ctr, suffix) if suffix else ws_ctr
 
-    # Relative paths → resolve against container workspace
     if not r.startswith("/"):
         return os.path.normpath(os.path.join(ws_ctr, r))
 
-    # As-is if valid, else best-effort remap
     if os.path.exists(r):
         return r
     return os.path.join(ws_ctr, r.lstrip("/"))
@@ -114,8 +101,8 @@ def list_tools() -> Dict[str, Any]:
                         "budget_seconds": {
                             "type": "number",
                             "minimum": 0,
-                            "default": 60,
-                            "description": "Soft time budget; the tool returns partial results and a continuation cursor when reached (0 disables)."
+                            "default": 0,
+                            "description": "Soft time budget; when >0 the tool returns partial results and a continuation cursor once reached (0 disables)."
                         }
                     },
                     "additionalProperties": False
@@ -140,9 +127,18 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
     # Pagination controls
     start_at: int = int(inp.get("start_at") or 0)
     file_limit: int = int(inp.get("file_limit") or 0)
-    budget_seconds: float = float(inp.get("budget_seconds") or 60.0)
 
-    # If debug_raw is false, ensure we do not dump raw ASTs even if env is set
+    # Budget: argument wins; else env; else default 0 (disabled)
+    if "budget_seconds" in inp and inp.get("budget_seconds") is not None:
+        budget_seconds = float(inp.get("budget_seconds"))
+    else:
+        env_b = os.environ.get("COBOL_PARSER_BUDGET_SECONDS")
+        try:
+            budget_seconds = float(env_b) if env_b is not None else 0.0
+        except Exception:
+            budget_seconds = 0.0
+
+    # If debug_raw is false, ensure env doesn’t force dumps
     if not debug_raw and os.environ.get("RAW_AST_DUMP_DIR"):
         try:
             os.environ.pop("RAW_AST_DUMP_DIR", None)
@@ -157,7 +153,7 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
         "start_at": max(0, start_at),
         "programs_emitted": 0,
         "copybooks_emitted": 0,
-        "parser_version": "normalizer=1.0.0,adapter=proleap/0.0.2",
+        "parser_version": "normalizer=1.0.0,adapter=proleap/0.0.3",
         "raw_dump_dir": raw_dump_dir if debug_raw else ""
     }
 
@@ -174,19 +170,19 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
     registry = SchemaRegistry(schema_dir)
     adapter = ProLeapAdapter()
 
-    # --- A) Build and emit Source Index ---
+    # --- A) Build Source Index ---
     index_data = build_source_index(root)
 
-    # sanitize: drop keys not in v1.0.0 schema
-    # Allowed keys confirmed against artifact-service error: remove format/copybook_dir flags etc.
+    # IMPORTANT: derive copy paths BEFORE sanitizing (we need dir hints)
+    copy_dirs_rel = derive_copy_paths(index_data)
+    copy_dirs_abs = [os.path.join(root, d) for d in copy_dirs_rel]
+
+    # --- Emit cam.asset.source_index (sanitized to match schema) ---
     allowed = {"relpath", "size_bytes", "sha256", "kind", "language_hint", "encoding", "program_id_guess"}
     for f in index_data.get("files", []) or []:
         for k in list(f.keys()):
             if k not in allowed:
                 f.pop(k, None)
-
-    copy_dirs_rel = derive_copy_paths(index_data)
-    copy_dirs_abs = [os.path.join(root, d) for d in copy_dirs_rel]
 
     idx_artifact = {"kind": "cam.asset.source_index", "version": "1.0.0", "body": index_data}
     if not registry.validate(idx_artifact):
@@ -203,6 +199,12 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
         targets_all: List[Tuple[str, str, str]] = [
             (os.path.join(root, f["relpath"]), f["relpath"], f["kind"]) for f in files
         ]
+        # Fallback: if no copybooks found by index, augment with a direct walk
+        if not any(t[2] == "copybook" for t in targets_all):
+            extra = list(filter_paths(walk_sources(root), allow_paths))
+            extra = [t for t in extra if t[2] == "copybook"]
+            if extra:
+                targets_all.extend(extra)
     else:
         targets_all = list(filter_paths(walk_sources(root), allow_paths))
 
@@ -253,17 +255,32 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
             ast = adapter.parse_program(text, rel_p, dialect, debug_raw, raw_dump_dir, copy_dirs_abs)
             data = normalize_program(ast, relpath=rel_p, sha256=content_hash)
             artifact = {"kind": "cam.cobol.program", "version": "1.0.0", "body": data}
-            if not registry.validate(artifact):
+            errors = registry.validate(artifact)
+            if not errors:
                 emitted_programs += 1
                 artifacts.append(artifact)
+            else:
+                # make the culprit obvious
+                diagnostics.append({
+                    "level": "error",
+                    "relpath": rel_p,
+                    "message": f"cam.cobol.program schema validation failed: {errors[:5]}",
+                })
 
         elif kind == "copybook":
             ast = adapter.parse_copybook(text, rel_p, dialect, debug_raw, raw_dump_dir)
             data = normalize_copybook(ast, relpath=rel_p, sha256=content_hash)
             artifact = {"kind": "cam.cobol.copybook", "version": "1.0.0", "body": data}
-            if not registry.validate(artifact):
+            errors = registry.validate(artifact)
+            if not errors:
                 emitted_copybooks += 1
                 artifacts.append(artifact)
+            else:
+                diagnostics.append({
+                    "level": "error",
+                    "relpath": rel_p,
+                    "message": f"cam.cobol.copybook schema validation failed: {errors[:5]}",
+                })
 
     stats["programs_emitted"] = emitted_programs
     stats["copybooks_emitted"] = emitted_copybooks
@@ -284,8 +301,6 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
 
     artifacts.sort(key=_sort_key)
 
-    # Return the *full* result to callers (useful if someone wants stats/diags),
-    # but keep the MCP envelope small by only placing artifacts under structuredContent.
     return {
         "artifacts": artifacts,
         "diagnostics": diagnostics,
@@ -295,7 +310,6 @@ def parse_tree(inp: Dict[str, Any]) -> Dict[str, Any]:
 
 # ------------------------------ Protocol --------------------------------
 def _send(obj: Dict[str, Any]) -> None:
-    # IMPORTANT: stdout is *only* for JSON-RPC
     sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 
@@ -305,7 +319,7 @@ def _send_error(id_val: Any, code: int, message: str, data: Dict[str, Any] | Non
 def _handle_initialize(msg: Dict[str, Any]) -> None:
     result = {
         "protocolVersion": "0.1",
-        "serverInfo": {"name": "mcp.cobol.parser", "version": "0.0.2"},
+        "serverInfo": {"name": "mcp.cobol.parser", "version": "0.0.3"},
         "capabilities": {"tools": {}},
     }
     _send({"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
@@ -329,20 +343,23 @@ def _handle_tools_call(msg: Dict[str, Any]) -> None:
         return
 
     try:
-        res = parse_tree(arguments)  # {artifacts, diagnostics, stats, continuation}
+        res = parse_tree(arguments)
 
-        # tiny human summary only (keeps stdout small & safe)
         st = res.get("stats", {})
         cont = res.get("continuation", {})
+        diags = res.get("diagnostics") or []
         summary = (
             f"COBOL parse {'partial' if cont.get('has_more') else 'complete'}."
             f" scanned={st.get('files_scanned', 0)} start_at={st.get('start_at', 0)}"
             f" programs={st.get('programs_emitted', 0)} copybooks={st.get('copybooks_emitted', 0)}"
-            f" diags={len(res.get('diagnostics') or [])}."
+            f" diags={len(diags)}."
         )
 
-        # IMPORTANT: mirror working git MCP: artifacts reside in structuredContent.artifacts
-        payload = {"artifacts": res.get("artifacts", [])}
+        payload = {
+            "artifacts": res.get("artifacts", []),
+            "continuation": res.get("continuation", {}),
+            "meta": {"stats": st, "diagnostics": diags},
+        }
 
         _send({
             "jsonrpc": "2.0",
@@ -350,12 +367,12 @@ def _handle_tools_call(msg: Dict[str, Any]) -> None:
             "result": {
                 "content": [{"type": "text", "text": summary}],
                 "structuredContent": payload,
+                "continuation": payload["continuation"],
                 "isError": False,
             },
         })
 
     except Exception as e:
-        # Errors still go via result with isError=True (per your client expectations)
         _send({
             "jsonrpc": "2.0",
             "id": msg.get("id"),
@@ -371,7 +388,6 @@ def run_stdio_loop() -> None:
         try:
             msg = json.loads(line.strip())
         except json.JSONDecodeError:
-            # ignore non-JSON garbage on stdin
             continue
         method = msg.get("method")
         if method == "initialize":

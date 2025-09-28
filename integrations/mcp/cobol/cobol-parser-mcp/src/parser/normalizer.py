@@ -8,7 +8,6 @@ def normalize_program(ast: Dict[str, Any], relpath: str, sha256: str) -> Dict[st
     # deterministic sorts
     paragraphs = sorted(paragraphs, key=lambda p: p.get("name", ""))
 
-    perf_sorted = []
     out_paragraphs: List[Dict[str, Any]] = []
     for p in paragraphs:
         performs = sorted(list({*p.get("performs", [])}))

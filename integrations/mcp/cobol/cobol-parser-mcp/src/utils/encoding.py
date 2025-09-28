@@ -18,8 +18,9 @@ def detect_encoding(raw: bytes, hint: str | None = None) -> Tuple[str, bytes]:
     """Return (encoding, decoded_bytes_without_bom)."""
     if hint:
         try:
-            text = raw.decode(hint, errors="strict")
-            return hint, raw.lstrip(b"")  # no BOM removal for hinted enc
+            # Trust the hint; return bytes as-is (no BOM stripping in hinted mode)
+            _ = raw.decode(hint, errors="strict")
+            return hint, raw
         except Exception:
             pass
 
@@ -34,3 +35,4 @@ def detect_encoding(raw: bytes, hint: str | None = None) -> Tuple[str, bytes]:
         enc = "utf-8"
 
     return enc, raw
+    

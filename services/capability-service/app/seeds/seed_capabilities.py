@@ -97,13 +97,13 @@ async def seed_capabilities() -> None:
             id="cap.cobol.parse",
             name="Parse COBOL Programs and Copybooks",
             description="Parses COBOL source files and extracts program and copybook structures.",
-            produces_kinds=["cam.cobol.program","cam.asset.source_index"],
+            produces_kinds=["cam.cobol.program","cam.asset.source_index","cam.cobol.copybook"],
             integration=MCPIntegrationBinding(
                 integration_ref="mcp.cobol.parser",
                 tool_calls=[
                     MCPToolCallSpec(
                         tool="parse_tree",
-                        output_kinds=["cam.cobol.program", "cam.asset.source_index"],
+                        output_kinds=["cam.cobol.program", "cam.asset.source_index","cam.cobol.copybook"],
                         timeout_sec=LONG_TIMEOUT,
                         retries=1,
                     )
